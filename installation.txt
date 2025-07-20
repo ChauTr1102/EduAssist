@@ -1,0 +1,29 @@
+if you are on linux
+
+sudo ubuntu-drivers autoinstall
+sudo reboot
+
+sudo apt install -y software-properties-common
+distribution=$(. /etc/os-release;echo $ID$VERSION_ID | sed -e 's/\.//g')
+sudo wget https://developer.download.nvidia.com/compute/cuda/repos/$distribution/x86_64/cuda-keyring_1.1-1_all.deb
+sudo dpkg -i cuda-keyring_1.1-1_all.deb
+
+sudo apt update
+sudo apt install -y cuda-toolkit-12
+
+Thêm vào cuối file ~/.zshrc (hoặc ~/.bashrc nếu dùng Bash):
+
+# CUDA Path
+export PATH=/usr/local/cuda/bin:$PATH
+export LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH
+
+sudo reboot
+
+check
+nvcc --version
+!apt-get install libcudnn8
+lưu ý phải tải đúng libcudnn8 libcudnn8 or 9 thì moiwschayj được
+
+
+
+apt-get install portaudio19-dev
