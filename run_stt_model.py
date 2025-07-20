@@ -11,8 +11,6 @@ model = WhisperModel(model_size, device="cuda", compute_type="int8_float16")
 # model = WhisperModel(model_size, device="cpu", compute_type="int8")
 
 
-
-
 def get_transcribe(audio):
 
     segments, info = model.transcribe(audio, beam_size=5)
