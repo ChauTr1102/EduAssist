@@ -6,6 +6,7 @@ from datasets import load_dataset
 from tqdm import tqdm
 import time
 import logging
+import torch
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -20,6 +21,16 @@ class OllamaLLMSummarizer:
             model_name: Ollama model name for summarization
         """
         self.model_name = model_name
+        
+        # Check if GPU is available
+        self.device = torch.device("cuda")
+        logger.info(f"Using device: {self.device}")
+        
+        # Update log message to explicitly indicate GPU usage
+        if self.device.type == "cuda":
+            logger.info("Using device: GPU")
+        else:
+            logger.info("Using device: CPU")
         
         # Initialize Ollama client
         try:
