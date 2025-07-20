@@ -201,3 +201,8 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+
+cuda-keyring_1.1-1_all.deb
+
+models
