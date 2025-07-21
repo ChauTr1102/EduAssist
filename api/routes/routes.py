@@ -12,6 +12,7 @@ from typing import Optional
 from dotenv import load_dotenv
 import tempfile
 from fastapi.responses import JSONResponse
+from faster_whisper import FasterWhisper
 
 load_dotenv()
 
