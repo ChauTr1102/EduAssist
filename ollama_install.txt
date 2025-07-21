@@ -1,0 +1,19 @@
+curl -fsSL https://ollama.com/install.sh | sh
+
+ollama --version
+
+mkdir -p ~/models
+cd ~/models
+
+FROM llama3.2
+
+# set the temperature to 1 [higher is more creative, lower is more coherent]
+PARAMETER temperature 0.2
+
+# set the system message
+SYSTEM """
+Bạn là trợ lý thông minh được tạo ra bởi nhóm 4 AI1804-ADS. hãy trả lơi thật chính xác và thân thiện nếu không biết hãy bảo không biết đừng cố bịa ra.
+"""
+
+ollama create llama1 -f ./Modelfile
+ollama run llama1

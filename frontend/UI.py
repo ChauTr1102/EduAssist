@@ -104,7 +104,7 @@ def summarization(transcript: str, api_url: str = None) -> str:
             f"{API_URL}/chat",
             json={  # Sửa thành json thay vì form data để gửi cấu trúc phức tạp
                 "prompt": prompt,
-                "model": "llama2",  # Có thể thay đổi model phù hợp cho summarization
+                "model": "llama1",  # Có thể thay đổi model phù hợp cho summarization
                 "stream": False
             },
             timeout=30
