@@ -1,17 +1,11 @@
-from fastapi import APIRouter, HTTPException, UploadFile, File
+from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
-import sys
-import os
-import logging
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
-from phobert_ollama_text_summarization import VietnameseSummarizationPipeline
+from EduAssist.phobert_ollama_text_summarization import VietnameseSummarizationPipeline
 import logging
 import time
 from datetime import datetime
 from typing import Optional
 from dotenv import load_dotenv
-import tempfile
-from fastapi.responses import JSONResponse
 
 load_dotenv()
 
@@ -22,7 +16,7 @@ logger = logging.getLogger(__name__)
 # Initialize router
 router = APIRouter()
 
-# Request and Response models for summarization
+# Request and Response models
 class SummarizeRequest(BaseModel):
     text: str = Field(..., min_length=10, description="Vietnamese text to summarize")
     summary_length: Optional[int] = Field(50, ge=10, le=500, description="Desired summary length in words")
@@ -55,10 +49,6 @@ except Exception as e:
     logger.error(f"Failed to initialize pipeline: {e}")
     pipeline = None
 
-
-# model_stt = FasterWhisper("large-v3")
-
-
 @router.get("/", response_model=APIInfo)
 async def home():
     """
@@ -88,35 +78,25 @@ async def home():
         }
     )
 
-
-@router.get("/test")
-def hehe():
-    import os, sys
-    return {"Python:": sys.executable,
-            "LD_LIBRARY_PATH:": os.environ.get("LD_LIBRARY_PATH")}
-
-
-
-@router.post("/stt")
-async def speech_to_text(audio: UploadFile = File(...)):
-    if audio.content_type not in ["audio/wav", "audio/x-wav", "audio/mpeg", "audio/mp3", "audio/x-m4a", "audio/m4a"]:
-        raise HTTPException(status_code=400, detail="Invalid audio format")
-    # Lưu file tạm ra đĩa
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as temp_audio:
-        temp_audio.write(await audio.read())
-        temp_audio_path = temp_audio.name
-    # result = model_stt.extract_text(temp_audio_path)
-    # return JSONResponse(content={"text": result})
-
-
-# Summarization endpoint
 @router.post("/summarize", response_model=SummarizeResponse, responses={503: {"model": ErrorResponse}, 400: {"model": ErrorResponse}})
 async def summarize(request: SummarizeRequest):
     """
     Summarize Vietnamese text using the complete pipeline.
+    
+    **Pipeline Flow:**
     1. Vietnamese text → English translation
-    2. English text → English summary (using Ollama LLM)
+    2. English text → English summary (using Ollama LLM)  
     3. English summary → Vietnamese summary
+    
+    **Parameters:**
+    - **text**: Vietnamese text to summarize (minimum 10 characters)
+    - **summary_length**: Desired length of summary in words (10-500, default: 50)
+    
+    **Returns:**
+    - **success**: Whether the operation was successful
+    - **summary**: The Vietnamese summary
+    - **processing_time**: Time taken to process in seconds
+    - **timestamp**: ISO timestamp of completion
     """
     if not pipeline:
         raise HTTPException(
@@ -127,19 +107,27 @@ async def summarize(request: SummarizeRequest):
                 "timestamp": datetime.now().isoformat()
             }
         )
+    
     try:
         start_time = time.time()
+        
+        # Process the text through the complete pipeline
         logger.info("Processing Vietnamese text through summarization pipeline...")
         results = pipeline.process(request.text.strip(), request.summary_length)
+        
         processing_time = time.time() - start_time
+        
+        # Return only the Vietnamese summary
         response = SummarizeResponse(
             success=True,
             summary=results['vietnamese_summary'],
             processing_time=round(processing_time, 2),
             timestamp=datetime.now().isoformat()
         )
+        
         logger.info(f"Summarization completed successfully in {processing_time:.2f} seconds")
         return response
+
     except Exception as e:
         logger.error(f"Summarization pipeline failed: {e}")
         raise HTTPException(
