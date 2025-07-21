@@ -1,17 +1,44 @@
-from flask import Flask, request, jsonify
-from flask_cors import CORS
-from phobert_ollama_text_summarization import VietnameseSummarizationPipeline
+from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel, Field
+from EduAssist.phobert_ollama_text_summarization import VietnameseSummarizationPipeline
 import logging
 import time
 from datetime import datetime
+from typing import Optional
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Initialize Flask app
-app = Flask(__name__)
-CORS(app)  # Enable CORS for web applications
+# Initialize router
+router = APIRouter()
+
+# Request and Response models
+class SummarizeRequest(BaseModel):
+    text: str = Field(..., min_length=10, description="Vietnamese text to summarize")
+    summary_length: Optional[int] = Field(50, ge=10, le=500, description="Desired summary length in words")
+
+class SummarizeResponse(BaseModel):
+    success: bool
+    summary: str
+    processing_time: float
+    timestamp: str
+
+class ErrorResponse(BaseModel):
+    success: bool = False
+    error: str
+    timestamp: str
+
+class APIInfo(BaseModel):
+    service: str
+    version: str
+    status: str
+    timestamp: str
+    endpoint: dict
+    usage: dict
 
 # Initialize the summarization pipeline
 logger.info("Initializing Vietnamese Summarization Pipeline...")
@@ -22,25 +49,25 @@ except Exception as e:
     logger.error(f"Failed to initialize pipeline: {e}")
     pipeline = None
 
-@app.route('/', methods=['GET'])
-def home():
+@router.get("/", response_model=APIInfo)
+async def home():
     """
-    API information endpoint.
+    API information endpoint with usage documentation.
     """
-    return jsonify({
-        "service": "Vietnamese Text Summarization API",
-        "version": "1.0.0",
-        "status": "running" if pipeline else "error",
-        "timestamp": datetime.now().isoformat(),
-        "endpoint": {
+    return APIInfo(
+        service="Vietnamese Text Summarization API",
+        version="1.0.0",
+        status="running" if pipeline else "error",
+        timestamp=datetime.now().isoformat(),
+        endpoint={
             "path": "/summarize",
             "method": "POST",
             "description": "Summarize Vietnamese text using the complete pipeline"
         },
-        "usage": {
+        usage={
             "request_format": {
-                "text": "<Vietnamese text to summarize>",
-                "summary_length": "<desired summary length in words, default: 50>"
+                "text": "Vietnamese text to summarize (min 10 characters)",
+                "summary_length": "Desired summary length in words (default: 50, range: 10-500)"
             },
             "response_format": {
                 "success": "boolean",
@@ -49,125 +76,65 @@ def home():
                 "timestamp": "ISO timestamp"
             }
         }
-    })
+    )
 
-@app.route('/summarize', methods=['POST'])
-def summarize():
+@router.post("/summarize", response_model=SummarizeResponse, responses={503: {"model": ErrorResponse}, 400: {"model": ErrorResponse}})
+async def summarize(request: SummarizeRequest):
     """
-    Vietnamese text summarization using the complete pipeline.
+    Summarize Vietnamese text using the complete pipeline.
     
-    Pipeline flow:
-    1. Vietnamese text -> English translation
-    2. English text -> English summary (using Ollama LLM)
-    3. English summary -> Vietnamese summary
+    **Pipeline Flow:**
+    1. Vietnamese text → English translation
+    2. English text → English summary (using Ollama LLM)  
+    3. English summary → Vietnamese summary
     
-    Request JSON format:
-    {
-        "text": "<Vietnamese text to summarize>",
-        "summary_length": <desired summary length in words, default: 50>
-    }
+    **Parameters:**
+    - **text**: Vietnamese text to summarize (minimum 10 characters)
+    - **summary_length**: Desired length of summary in words (10-500, default: 50)
     
-    Response JSON format:
-    {
-        "success": true,
-        "summary": "<Vietnamese summary>",
-        "processing_time": <time in seconds>,
-        "timestamp": "<ISO timestamp>"
-    }
+    **Returns:**
+    - **success**: Whether the operation was successful
+    - **summary**: The Vietnamese summary
+    - **processing_time**: Time taken to process in seconds
+    - **timestamp**: ISO timestamp of completion
     """
     if not pipeline:
-        return jsonify({
-            "success": False,
-            "error": "Pipeline not initialized",
-            "timestamp": datetime.now().isoformat()
-        }), 503
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "success": False,
+                "error": "Pipeline not initialized",
+                "timestamp": datetime.now().isoformat()
+            }
+        )
     
     try:
         start_time = time.time()
         
-        # Parse request JSON
-        data = request.get_json()
-        if not data:
-            return jsonify({
-                "success": False,
-                "error": "No JSON data provided",
-                "timestamp": datetime.now().isoformat()
-            }), 400
-        
-        vietnamese_text = data.get('text', '').strip()
-        summary_length = data.get('summary_length', 50)
-
-        # Validate input
-        if not vietnamese_text:
-            return jsonify({
-                "success": False,
-                "error": "Text is required",
-                "timestamp": datetime.now().isoformat()
-            }), 400
-        
-        if len(vietnamese_text) < 10:
-            return jsonify({
-                "success": False,
-                "error": "Text too short (minimum 10 characters)",
-                "timestamp": datetime.now().isoformat()
-            }), 400
-
         # Process the text through the complete pipeline
         logger.info("Processing Vietnamese text through summarization pipeline...")
-        results = pipeline.process(vietnamese_text, summary_length)
+        results = pipeline.process(request.text.strip(), request.summary_length)
         
         processing_time = time.time() - start_time
         
         # Return only the Vietnamese summary
-        response = {
-            "success": True,
-            "summary": results['vietnamese_summary'],
-            "processing_time": round(processing_time, 2),
-            "timestamp": datetime.now().isoformat()
-        }
+        response = SummarizeResponse(
+            success=True,
+            summary=results['vietnamese_summary'],
+            processing_time=round(processing_time, 2),
+            timestamp=datetime.now().isoformat()
+        )
         
         logger.info(f"Summarization completed successfully in {processing_time:.2f} seconds")
-        return jsonify(response)
+        return response
 
     except Exception as e:
         logger.error(f"Summarization pipeline failed: {e}")
-        return jsonify({
-            "success": False,
-            "error": str(e),
-            "timestamp": datetime.now().isoformat()
-        }), 500
-
-@app.errorhandler(404)
-def not_found(error):
-    return jsonify({
-        "success": False,
-        "error": "Endpoint not found",
-        "message": "Use GET / for API information or POST /summarize for text summarization",
-        "timestamp": datetime.now().isoformat()
-    }), 404
-
-@app.errorhandler(500)
-def internal_error(error):
-    return jsonify({
-        "success": False,
-        "error": "Internal server error",
-        "timestamp": datetime.now().isoformat()
-    }), 500
-
-if __name__ == '__main__':
-    print("=== Vietnamese Summarization API ===")
-    print("Starting server on http://0.0.0.0:5000")
-    print("\nAPI Endpoints:")
-    print("  GET  /          - API information and usage")
-    print("  POST /summarize - Vietnamese text summarization")
-    print("\nExample usage:")
-    print('  curl -X POST http://localhost:5000/summarize \\')
-    print('       -H "Content-Type: application/json" \\')
-    print('       -d \'{"text": "Đây là văn bản tiếng Việt cần tóm tắt...", "summary_length": 50}\'')
-    print("\nExample response:")
-    print('  {"success": true, "summary": "Tóm tắt tiếng Việt...", "processing_time": 2.34}')
-    print("\nMake sure Ollama is running: ollama serve")
-    print("Make sure model is available: ollama pull llama3.2:3b")
-    print("=" * 50)
-    
-    app.run(host='0.0.0.0', port=5000, debug=True)
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "success": False,
+                "error": str(e),
+                "timestamp": datetime.now().isoformat()
+            }
+        )

@@ -6,7 +6,7 @@ import evaluate
 import json
 import numpy as np
 from datetime import datetime
-from phobert_ollama_text_summarization import VietnameseSummarizationPipeline  # import your pipeline
+from EduAssist.phobert_ollama_text_summarization import VietnameseSummarizationPipeline  # import your pipeline
 
 # Check MoverScore availability
 MOVERSCORE_AVAILABLE = False
