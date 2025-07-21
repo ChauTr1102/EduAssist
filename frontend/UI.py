@@ -130,10 +130,6 @@ def summarization(transcript: str, api_url: str = None) -> str:
         return f"⚠️ Lỗi không xác định: {str(e)}"
 
 
-
-
-
-
 with gr.Blocks(title="Meeting Secretary") as demo:
     with gr.Sidebar(width=200):
         gr.Markdown("## Meeting Secretary")

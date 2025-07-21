@@ -5,6 +5,7 @@ ollama --version
 mkdir -p ~/models
 cd ~/models
 
+
 FROM llama3.2
 
 # set the temperature to 1 [higher is more creative, lower is more coherent]
