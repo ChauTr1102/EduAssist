@@ -56,7 +56,7 @@ except Exception as e:
     pipeline = None
 
 
-# model_stt = FasterWhisper("large-v3")
+model_stt = FasterWhisper("large-v3")
 
 
 @router.get("/", response_model=APIInfo)
@@ -105,8 +105,8 @@ async def speech_to_text(audio: UploadFile = File(...)):
     with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as temp_audio:
         temp_audio.write(await audio.read())
         temp_audio_path = temp_audio.name
-    # result = model_stt.extract_text(temp_audio_path)
-    # return JSONResponse(content={"text": result})
+    result = model_stt.extract_text(temp_audio_path)
+    return JSONResponse(content={"text": result})
 
 
 # Summarization endpoint
