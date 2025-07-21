@@ -1,31 +1,84 @@
 import gradio as gr
-from faster_whisper import WhisperModel
+import requests
+import tempfile
 import os
-model_size = "large-v3"
+from typing import Optional
 
-# Run on GPU with FP16
-model = WhisperModel(model_size, device="cuda", compute_type="int8_float16")
+# Cấu hình API
+API_URL = "http://localhost:8000"  # Thay đổi nếu API chạy ở URL khác
 
-def get_transcribe(audio):
-    if not audio:
-        return "No audio file provided"
 
-    # Check if file exists
-    if not os.path.exists(audio):
-        return "Error: File not found"
+def call_api(endpoint: str, method: str = "get", params: Optional[dict] = None, files: Optional[dict] = None):
+    """Hàm gọi API đến backend"""
+    try:
+        if method.lower() == "get":
+            response = requests.get(f"{API_URL}/{endpoint}", params=params)
+        elif method.lower() == "post":
+            response = requests.post(f"{API_URL}/{endpoint}", params=params, files=files)
+        else:
+            return {"error": "Invalid method"}
+
+        return response.json() if response.status_code == 200 else {"error": f"API error: {response.text}"}
+    except Exception as e:
+        return {"error": f"Connection error: {str(e)}"}
+
+
+def get_model_info():
+    """Lấy thông tin model hiện tại"""
+    return call_api("model-info")
+
+
+def transcribe_audio(audio_path: str, model_name: str = "large-v3"):
+    """Gửi audio đến API để chuyển đổi thành văn bản"""
+    if not audio_path:
+        return {"error": "Vui lòng chọn file audio"}
 
     try:
-        segments, info = model.transcribe(audio, beam_size=5)
-        print(f"Detected language '{info.language}' with probability {info.language_probability:.2f}")
+        with open(audio_path, "rb") as audio_file:
+            return call_api(
+                "stt",
+                method="post",
+                files={"audio": audio_file}
+            )
+    except Exception as e:
+        return {"error": f"Lỗi khi xử lý file: {str(e)}"}
 
-        full_text = ""
-        for segment in segments:
-            full_text += f"[{segment.start:.2f}s -> {segment.end:.2f}s] {segment.text}\n"
 
-        return full_text.strip()
+def update_model_info():
+    """Cập nhật thông tin model trên giao diện"""
+    info = get_model_info()
+    if "error" in info:
+        return info["error"]
+
+    return f"""
+    **Thông tin Model:**
+    - Tên model: {info.get('model_name', 'N/A')}
+    - Thư mục: `{info.get('models_dir', 'N/A')}`
+    - Đường dẫn: `{info.get('model_path', 'N/A')}`
+    """
+
+
+def process_audio(audio_path: str):
+    """Xử lý audio từ file path và gửi đến API"""
+    if not audio_path:
+        return "Vui lòng chọn file audio trước", ""
+
+    try:
+        response = requests.post(
+            f"{API_URL}/stt",
+            data={"audio_path": audio_path}  # Gửi dưới dạng form data
+        )
+
+        if response.status_code == 200:
+            result = response.json()
+            if result.get("success"):
+                transcription = result.get("result", {})
+                return transcription.get("text").strip()
+        return "⚠️ Lỗi: " + response.json().get("detail", "Unknown error")
 
     except Exception as e:
-        return f"Error during transcription: {str(e)}"
+        return f"⚠️ Lỗi kết nối: {str(e)}", ""
+
 
 
 with gr.Blocks(title="Meeting Secretary") as demo:
@@ -53,7 +106,7 @@ with gr.Blocks(title="Meeting Secretary") as demo:
                 )
 
         submit_btn.click(
-            fn=get_transcribe,
+            fn=process_audio,
             inputs=audio_input,
             outputs=output_text
         )

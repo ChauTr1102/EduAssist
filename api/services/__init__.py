@@ -1,3 +1,3 @@
-from faster_whisper import WhisperModel
+from .whisper import FasterWhisper
 
-
+__all__ = ["FasterWhisper"]
