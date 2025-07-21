@@ -3,7 +3,8 @@ from fastapi.responses import JSONResponse
 import tempfile
 import os
 from api.services.whisper import FasterWhisper
-
+from api.services.local_llm import ChatRequest
+import httpx
 router = APIRouter()
 
 # Khởi tạo model với thư mục tùy chỉnh
@@ -59,3 +60,19 @@ async def speech_to_text(audio_path: str = Form(...)):
             status_code=500,
             detail=f"Lỗi khi xử lý audio: {str(e)}"
         )
+@router.post("/chat")
+async def chat_with_ai(request: ChatRequest):
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                "http://localhost:11434/api/generate",
+                json={
+                    "model": request.model,
+                    "prompt": request.prompt,
+                    "stream": request.stream
+                },
+                timeout=60.0
+            )
+            return response.json()
+    except httpx.RequestError as e:
+        raise HTTPException(status_code=500, detail=str(e))

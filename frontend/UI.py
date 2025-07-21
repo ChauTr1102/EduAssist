@@ -2,6 +2,7 @@ import gradio as gr
 import requests
 import tempfile
 import os
+import random
 from typing import Optional
 
 # Cấu hình API
@@ -27,21 +28,6 @@ def get_model_info():
     """Lấy thông tin model hiện tại"""
     return call_api("model-info")
 
-
-def transcribe_audio(audio_path: str, model_name: str = "large-v3"):
-    """Gửi audio đến API để chuyển đổi thành văn bản"""
-    if not audio_path:
-        return {"error": "Vui lòng chọn file audio"}
-
-    try:
-        with open(audio_path, "rb") as audio_file:
-            return call_api(
-                "stt",
-                method="post",
-                files={"audio": audio_file}
-            )
-    except Exception as e:
-        return {"error": f"Lỗi khi xử lý file: {str(e)}"}
 
 
 def update_model_info():
@@ -73,12 +59,17 @@ def process_audio(audio_path: str):
             result = response.json()
             if result.get("success"):
                 transcription = result.get("result", {})
-                return transcription.get("text").strip()
+                return transcription.get("transcribe_by_sentence").strip()
         return "⚠️ Lỗi: " + response.json().get("detail", "Unknown error")
 
     except Exception as e:
         return f"⚠️ Lỗi kết nối: {str(e)}", ""
 
+
+
+
+def random_response(message, history):
+    return random.choice(["Yes", "No"])
 
 
 with gr.Blocks(title="Meeting Secretary") as demo:
@@ -97,7 +88,17 @@ with gr.Blocks(title="Meeting Secretary") as demo:
                 )
                 submit_btn = gr.Button("Transcribe", variant="primary")
 
-            with gr.Column(scale=2):
+                gr.ChatInterface(random_response, type="messages", autofocus=False)
+
+            with gr.Column(scale=4):
+                summarization_box = gr.Textbox(
+                    label="Summarization",
+                    placeholder="Your Summarization will appear here...",
+                    lines=15,
+                    interactive=True
+                )
+
+            with gr.Column(scale=1):
                 output_text = gr.Textbox(
                     label="Transcription",
                     placeholder="Your transcription will appear here...",
@@ -105,11 +106,11 @@ with gr.Blocks(title="Meeting Secretary") as demo:
                     interactive=True
                 )
 
-        submit_btn.click(
-            fn=process_audio,
-            inputs=audio_input,
-            outputs=output_text
-        )
+    submit_btn.click(
+        fn=process_audio,
+        inputs=audio_input,
+        outputs=output_text
+    )
 
 if __name__ == "__main__":
     demo.launch(server_port=7860, share=True)
