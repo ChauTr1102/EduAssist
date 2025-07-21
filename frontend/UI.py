@@ -5,6 +5,9 @@ import os
 import random
 from typing import Optional
 
+
+current_transcript = ""
+
 # Cấu hình API
 API_URL = "http://localhost:8000"  # Thay đổi nếu API chạy ở URL khác
 
@@ -44,7 +47,8 @@ def update_model_info():
     """
 
 
-def process_audio(audio_path: str):
+def get_transcribe(audio_path: str):
+    global current_transcript
     """Xử lý audio từ file path và gửi đến API"""
     if not audio_path:
         return "Vui lòng chọn file audio trước", ""
@@ -58,18 +62,76 @@ def process_audio(audio_path: str):
         if response.status_code == 200:
             result = response.json()
             if result.get("success"):
-                transcription = result.get("result", {})
-                return transcription.get("transcribe_by_sentence").strip()
+                current_transcript = result.get("result", {})
+                current_transcript  =  current_transcript.get("transcribe_by_sentence").strip()
+                return current_transcript
         return "⚠️ Lỗi: " + response.json().get("detail", "Unknown error")
 
     except Exception as e:
         return f"⚠️ Lỗi kết nối: {str(e)}", ""
 
-
-
-
 def random_response(message, history):
     return random.choice(["Yes", "No"])
+
+def summarization(transcript: str, api_url: str = None) -> str:
+    global current_transcript
+    """
+    Tóm tắt nội dung hội thoại bằng AI
+
+    Args:
+        transcript (str): Nội dung hội thoại cần tóm tắt
+        api_url (str, optional): URL endpoint API. Mặc định sẽ dùng biến toàn cục API_URL
+
+    Returns:
+        str: Nội dung đã được tóm tắt hoặc thông báo lỗi
+    """
+    # Định dạng prompt chuyên biệt cho tóm tắt hội thoại
+    prompt = f"""
+    Hãy tóm tắt cuộc hội thoại sau đây thành các ý chính ngắn gọn, 
+    giữ nguyên các thông tin quan trọng như tên riêng, số liệu, 
+    và các quyết định quan trọng:
+
+    {current_transcript}
+
+    Yêu cầu:
+    - Ngôn ngữ giữ nguyên như bản gốc
+    - Độ dài khoảng 20-30% so với bản gốc
+    - Đánh dấu các điểm quan trọng bằng bullet points (•)
+    """
+    print(transcript)
+    try:
+        response = requests.post(
+            f"{API_URL}/chat",
+            json={  # Sửa thành json thay vì form data để gửi cấu trúc phức tạp
+                "prompt": prompt,
+                "model": "llama2",  # Có thể thay đổi model phù hợp cho summarization
+                "stream": False
+            },
+            timeout=30
+        )
+
+        response.raise_for_status()  # Tự động raise exception nếu có lỗi HTTP
+
+        result = response.json()
+
+        # Xử lý response từ API
+        if isinstance(result, dict):
+            return result.get("response", "⚠️ Không nhận được nội dung tóm tắt")
+        elif isinstance(result, str):
+            return result
+        else:
+            return "⚠️ Định dạng response không hợp lệ"
+
+    except requests.exceptions.RequestException as e:
+        return f"⚠️ Lỗi kết nối: {str(e)}"
+    except ValueError as e:
+        return f"⚠️ Lỗi xử lý dữ liệu: {str(e)}"
+    except Exception as e:
+        return f"⚠️ Lỗi không xác định: {str(e)}"
+
+
+
+
 
 
 with gr.Blocks(title="Meeting Secretary") as demo:
@@ -107,10 +169,16 @@ with gr.Blocks(title="Meeting Secretary") as demo:
                 )
 
     submit_btn.click(
-        fn=process_audio,
+        fn=get_transcribe,
         inputs=audio_input,
         outputs=output_text
+    ).then(
+        fn = summarization,
+        inputs = current_transcript,
+        outputs = summarization_box
     )
+
+
 
 if __name__ == "__main__":
     demo.launch(server_port=7860, share=True)
