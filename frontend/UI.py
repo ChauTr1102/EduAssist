@@ -220,6 +220,57 @@ def chat_summary_interface(message, history, summarize_script):
     except Exception as e:
         return f"Error: {e}"
 
+
+def get_response_from_bot(message, history, transcript):
+    history_str = ""
+    for turn in history:
+        history_str += f"{turn["role"]}: {turn["content"]}\n"
+    prompt = f"""
+Bạn là một trợ lý AI thân thiện. Bạn sẽ nhận được một bản tóm tắt cuộc họp và câu hỏi của người dùng,
+nhiệm vụ của bạn là hãy dựa vào bản tóm tắt cuộc họp phía trên và trả lời câu hỏi của người dùng chính xác nhất. 
+Tuyệt đối không được bịa ra câu trả lời về cuộc hội thoại!
+
+Bản tóm tắt cuộc họp:
+{transcript}
+
+Lịch sử cuộc hội thoại:
+{history_str}
+
+câu hỏi của người dùng là:
+{message}
+"""
+
+    try:
+        response = requests.post(
+            f"{API_URL}/chat",
+            json={  # Sửa thành json thay vì form data để gửi cấu trúc phức tạp
+                "prompt": prompt,
+                "model": "llama1",  # Có thể thay đổi model phù hợp cho summarization
+                "stream": False
+            },
+            timeout=300
+        )
+
+        response.raise_for_status()  # Tự động raise exception nếu có lỗi HTTP
+
+        result = response.json()
+
+        # Xử lý response từ API
+        if isinstance(result, dict):
+            return result.get("response", "⚠️ Không nhận được nội dung tóm tắt")
+        elif isinstance(result, str):
+            return result
+        else:
+            return "⚠️ Định dạng response không hợp lệ"
+
+    except requests.exceptions.RequestException as e:
+        return f"⚠️ Lỗi kết nối: {str(e)}"
+    except ValueError as e:
+        return f"⚠️ Lỗi xử lý dữ liệu: {str(e)}"
+    except Exception as e:
+        return f"⚠️ Lỗi không xác định: {str(e)}"
+
+
 with gr.Blocks(title="Meeting Secretary") as demo:
     with gr.Sidebar(width=200):
         gr.Markdown("## Meeting Secretary")
@@ -268,7 +319,8 @@ with gr.Blocks(title="Meeting Secretary") as demo:
                     interactive=True
                 )
 
-                gr.ChatInterface(random_response, type="messages", autofocus=False)
+                gr.ChatInterface(get_response_from_bot, type="messages", autofocus=False,fill_height=True,
+                                 save_history=True, additional_inputs=summarization_box)
 
         download_box = gr.Textbox(
             label="Downloading audio file",
@@ -381,7 +433,7 @@ with gr.Blocks(title="Meeting Secretary") as demo:
         inputs=on_download_box,
         outputs=on_output_text
     ).then(
-        fn = summarization,
+        fn = summarization_gemini,
         inputs =[on_output_text, on_prompt_box],
         outputs = on_summarization_box
     )
