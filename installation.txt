@@ -27,3 +27,6 @@ lưu ý phải tải đúng libcudnn8 libcudnn8 or 9 thì moiwschayj được
 
 
 apt-get install portaudio19-dev
+
+
+sudo apt install ffmpeg
