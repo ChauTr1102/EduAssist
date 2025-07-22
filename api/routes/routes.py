@@ -4,6 +4,7 @@ import tempfile
 import os
 from api.services.whisper import FasterWhisper
 from api.services.local_llm import ChatRequest
+from api.services.video_to_audio_convert import *
 import httpx
 router = APIRouter()
 
@@ -71,8 +72,25 @@ async def chat_with_ai(request: ChatRequest):
                     "prompt": request.prompt,
                     "stream": request.stream
                 },
-                timeout=60.0
+
             )
             return response.json()
     except httpx.RequestError as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/extract-audio")
+async def extract_audio_from_path(request: VideoPathRequest):
+    try:
+        audio_path = extract_audio(request.video_path, request.output_dir)
+
+        return {
+            "status": "success",
+            "audio_path": audio_path,
+            "filename": os.path.basename(audio_path)
+        }
+
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Audio extraction failed: {str(e)}")

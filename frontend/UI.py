@@ -4,10 +4,11 @@ import tempfile
 import os
 import random
 from typing import Optional
-
+import json
 
 current_transcript = ""
-
+current_video_path  = ''
+file_type = " "
 # Cấu hình API
 API_URL = "http://localhost:8000"  # Thay đổi nếu API chạy ở URL khác
 
@@ -45,6 +46,34 @@ def update_model_info():
     - Thư mục: `{info.get('models_dir', 'N/A')}`
     - Đường dẫn: `{info.get('model_path', 'N/A')}`
     """
+def extract_video_to_audio(video_path:str,output_dir: Optional[str] = None):
+    global current_video_path
+    if not os.path.exists(video_path):
+        raise FileNotFoundError(f"Video file not found: {video_path}")
+
+        # Chuẩn bị payload
+    payload = {
+        "video_path": video_path
+    }
+    if output_dir:
+        payload["output_dir"] = output_dir
+
+    try:
+        # Gọi API
+        response = requests.post(
+            f"{API_URL}/extract-audio",
+            json=payload
+        )
+        response.raise_for_status()
+
+        result = response.json()
+        if result["status"] != "success":
+            raise Exception(f"API error: {result.get('detail', 'Unknown error')}")
+        current_video_path = result["audio_path"]
+        return result["audio_path"]
+
+    except requests.exceptions.RequestException as e:
+        raise Exception(f"API request failed: {str(e)}")
 
 
 def get_transcribe(audio_path: str):
@@ -73,6 +102,7 @@ def get_transcribe(audio_path: str):
 def random_response(message, history):
     return random.choice(["Yes", "No"])
 
+
 def summarization(transcript: str, api_url: str = None) -> str:
     global current_transcript
     """
@@ -98,7 +128,7 @@ def summarization(transcript: str, api_url: str = None) -> str:
     - Độ dài khoảng 20-30% so với bản gốc
     - Đánh dấu các điểm quan trọng bằng bullet points (•)
     """
-    print(transcript)
+
     try:
         response = requests.post(
             f"{API_URL}/chat",
@@ -130,7 +160,7 @@ def summarization(transcript: str, api_url: str = None) -> str:
         return f"⚠️ Lỗi không xác định: {str(e)}"
 
 
-with gr.Blocks(title="Meeting Secretary") as demo:
+with gr.Blocks(title="Meeting Secretary",fill_height=True) as demo:
     with gr.Sidebar(width=200):
         gr.Markdown("## Meeting Secretary")
         gr.Markdown("Upload or record audio to get transcription")
@@ -144,9 +174,9 @@ with gr.Blocks(title="Meeting Secretary") as demo:
                     label="Audio Input",
                     interactive=True
                 )
-                submit_btn = gr.Button("Transcribe", variant="primary")
 
-                gr.ChatInterface(random_response, type="messages", autofocus=False)
+                submit_audio_btn = gr.Button("Transcribe", variant="primary")
+                gr.ChatInterface(random_response, type="messages", autofocus=False,fill_height=True)
 
             with gr.Column(scale=4):
                 summarization_box = gr.Textbox(
@@ -155,16 +185,28 @@ with gr.Blocks(title="Meeting Secretary") as demo:
                     lines=15,
                     interactive=True
                 )
+                video_input = gr.Video(
+                    sources=["upload", "webcam"],
+                    label="upload or capture video",
+                    interactive=True,
+                    height=245
+                )
+                submit_video_btn = gr.Button("Transcribe", variant="primary")
+
 
             with gr.Column(scale=1):
                 output_text = gr.Textbox(
                     label="Transcription",
                     placeholder="Your transcription will appear here...",
-                    lines=15,
-                    interactive=True
+                    lines=31,
+                    interactive=True,
                 )
-
-    submit_btn.click(
+        download_box = gr.Textbox(
+            label="Downloading audio file",
+            placeholder="Your file is store in here",
+            interactive=True,
+        )
+    submit_audio_btn.click(
         fn=get_transcribe,
         inputs=audio_input,
         outputs=output_text
@@ -173,8 +215,19 @@ with gr.Blocks(title="Meeting Secretary") as demo:
         inputs = current_transcript,
         outputs = summarization_box
     )
-
-
+    submit_video_btn.click(
+        fn=extract_video_to_audio,
+        inputs=video_input,
+        outputs = download_box
+    ).then(
+        fn=get_transcribe,
+        inputs=download_box,
+        outputs = output_text
+    ).then(
+        fn = summarization,
+         inputs =current_transcript,
+        outputs = summarization_box
+    )
 
 if __name__ == "__main__":
     demo.launch(server_port=7860, share=True)
