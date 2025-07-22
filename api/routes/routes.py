@@ -9,7 +9,7 @@ import httpx
 router = APIRouter()
 
 # Khởi tạo model với thư mục tùy chỉnh
-model_stt = FasterWhisper("large-v3", models_dir="models")
+model_stt = FasterWhisper("base", models_dir="models")
 
 
 @router.get("/")
@@ -72,7 +72,7 @@ async def chat_with_ai(request: ChatRequest):
                     "prompt": request.prompt,
                     "stream": request.stream
                 },
-
+                timeout=60.0
             )
             return response.json()
     except httpx.RequestError as e:
