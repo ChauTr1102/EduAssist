@@ -4,7 +4,7 @@ from pathlib import Path
 
 
 class FasterWhisper:
-    def __init__(self, model_name="large-v3", models_dir="models", ):
+    def __init__(self, model_name="large-v3", models_dir="models" ):
         """
         Khởi tạo model Whisper với khả năng tự động tải model vào thư mục chỉ định
 

@@ -137,7 +137,7 @@ def summarization(transcript: str, api_url: str = None) -> str:
                 "model": "llama1",  # Có thể thay đổi model phù hợp cho summarization
                 "stream": False
             },
-            timeout=30
+            timeout=300
         )
 
         response.raise_for_status()  # Tự động raise exception nếu có lỗi HTTP
