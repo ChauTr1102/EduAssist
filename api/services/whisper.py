@@ -1,3 +1,4 @@
+from api.services import *
 from faster_whisper import WhisperModel
 import os
 from pathlib import Path
@@ -40,11 +41,12 @@ class FasterWhisper:
         """
         try:
             segments, info = self.model.transcribe(audio_path, beam_size=beam_size)
-            transcribe = ""
+            transcribe_by_sentence = ""
             for segment in segments:
-                transcribe += f"[{segment.start:.2f}s -> {segment.end:.2f}s] {segment.text}\n"
+                transcribe_by_sentence += f"[{segment.start:.2f}s -> {segment.end:.2f}s] {segment.text}\n"
+
             return {
-                "text":transcribe,
+                "transcribe_by_sentence": transcribe_by_sentence,
                 "language": info.language,
                 "language_probability": info.language_probability
             }

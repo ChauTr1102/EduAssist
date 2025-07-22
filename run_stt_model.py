@@ -17,3 +17,4 @@ def get_transcribe(audio):
     print("Detected language '%s' with probability %f" % (info.language, info.language_probability))
     for segment in segments:
         yield ("[%.2fs -> %.2fs] %s" % (segment.start, segment.end, segment.text))
+        

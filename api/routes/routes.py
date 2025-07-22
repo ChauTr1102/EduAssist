@@ -1,20 +1,8 @@
-from fastapi import APIRouter, HTTPException, UploadFile, File
-from pydantic import BaseModel, Field
-import sys
 import os
-import logging
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
-from phobert_ollama_text_summarization import VietnameseSummarizationPipeline
-import logging
-import time
-from datetime import datetime
-from typing import Optional
-from dotenv import load_dotenv
-import tempfile
-from fastapi.responses import JSONResponse
-from faster_whisper import FasterWhisper
 
-load_dotenv()
+from api.routes import *
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
+
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -22,30 +10,6 @@ logger = logging.getLogger(__name__)
 
 # Initialize router
 router = APIRouter()
-
-# Request and Response models for summarization
-class SummarizeRequest(BaseModel):
-    text: str = Field(..., min_length=10, description="Vietnamese text to summarize")
-    summary_length: Optional[int] = Field(50, ge=10, le=500, description="Desired summary length in words")
-
-class SummarizeResponse(BaseModel):
-    success: bool
-    summary: str
-    processing_time: float
-    timestamp: str
-
-class ErrorResponse(BaseModel):
-    success: bool = False
-    error: str
-    timestamp: str
-
-class APIInfo(BaseModel):
-    service: str
-    version: str
-    status: str
-    timestamp: str
-    endpoint: dict
-    usage: dict
 
 # Initialize the summarization pipeline
 logger.info("Initializing Vietnamese Summarization Pipeline...")
@@ -58,57 +22,51 @@ except Exception as e:
 
 
 model_stt = FasterWhisper("large-v3")
-
+model_llm = LLM(os.getenv("API_KEY"))
 
 @router.get("/", response_model=APIInfo)
 async def home():
-    """
-    API information endpoint with usage documentation.
-    """
-    return APIInfo(
-        service="Vietnamese Text Summarization API",
-        version="1.0.0",
-        status="running" if pipeline else "error",
-        timestamp=datetime.now().isoformat(),
-        endpoint={
-            "path": "/summarize",
-            "method": "POST",
-            "description": "Summarize Vietnamese text using the complete pipeline"
-        },
-        usage={
-            "request_format": {
-                "text": "Vietnamese text to summarize (min 10 characters)",
-                "summary_length": "Desired summary length in words (default: 50, range: 10-500)"
-            },
-            "response_format": {
-                "success": "boolean",
-                "summary": "Vietnamese summary text",
-                "processing_time": "time in seconds",
-                "timestamp": "ISO timestamp"
-            }
-        }
-    )
-
-
-@router.get("/test")
-def hehe():
-    import os, sys
-    return {"Python:": sys.executable,
-            "LD_LIBRARY_PATH:": os.environ.get("LD_LIBRARY_PATH")}
-
+    return "Hello hehe"
 
 
 @router.post("/stt")
-async def speech_to_text(audio: UploadFile = File(...)):
-    if audio.content_type not in ["audio/wav", "audio/x-wav", "audio/mpeg", "audio/mp3", "audio/x-m4a", "audio/m4a"]:
-        raise HTTPException(status_code=400, detail="Invalid audio format")
-    # Lưu file tạm ra đĩa
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as temp_audio:
-        temp_audio.write(await audio.read())
-        temp_audio_path = temp_audio.name
-    result = model_stt.extract_text(temp_audio_path)
-    return JSONResponse(content={"text": result})
+async def speech_to_text(audio_path: str = Form(...)):
+    """
+    Chuyển đổi audio thành văn bản từ file path
+    Hỗ trợ định dạng: WAV, MP3, M4A
+    """
+    # Kiểm tra file có tồn tại không
+    if not os.path.exists(audio_path):
+        raise HTTPException(
+            status_code=400,
+            detail=f"File không tồn tại: {audio_path}"
+        )
 
+    # Kiểm tra định dạng file
+    allowed_extensions = ['.wav', '.mp3', '.m4a']
+    file_ext = os.path.splitext(audio_path)[1].lower()
+
+    if file_ext not in allowed_extensions:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Định dạng không hỗ trợ. Hỗ trợ: {', '.join(allowed_extensions)}"
+        )
+
+    try:
+        # Xử lý audio trực tiếp từ file path
+        result = model_stt.extract_text(audio_path)
+
+        return JSONResponse(content={
+            "success": True,
+            "result": result,
+            "file_path": audio_path  # Trả về path để debug
+        })
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Lỗi khi xử lý audio: {str(e)}"
+        )
 
 # Summarization endpoint
 @router.post("/summarize", response_model=SummarizeResponse, responses={503: {"model": ErrorResponse}, 400: {"model": ErrorResponse}})
@@ -151,3 +109,52 @@ async def summarize(request: SummarizeRequest):
                 "timestamp": datetime.now().isoformat()
             }
         )
+
+
+@router.post("/chat")
+async def chat_with_ai(request: ChatRequest):
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                "http://localhost:11434/api/generate",
+                json={
+                    "model": request.model,
+                    "prompt": request.prompt,
+                    "stream": request.stream
+                },
+                timeout=60.0
+            )
+            return response.json()
+    except httpx.RequestError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/summarize_gemini")
+async def summarize_gemini(script: Script):
+    prompt = model_llm.prompt_summarize(script.script)
+    result = await model_llm.send_message_gemini(prompt)
+    return result
+
+
+@router.post("/chat_gemini")
+async def summarize_gemini(user_input: UserInput):
+    prompt = model_llm.prompt_qa_script(user_input.user_input, user_input.summarize_script)
+    result = await model_llm.send_message_gemini(prompt)
+    return result
+
+
+@router.post("/extract-audio")
+async def extract_audio_from_path(request: VideoPathRequest):
+    try:
+        audio_path = extract_audio(request.video_path, request.output_dir)
+
+        return {
+            "status": "success",
+            "audio_path": audio_path,
+            "filename": os.path.basename(audio_path)
+        }
+
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Audio extraction failed: {str(e)}")
