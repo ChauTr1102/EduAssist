@@ -99,8 +99,48 @@ def get_transcribe(audio_path: str):
     except Exception as e:
         return f"⚠️ Lỗi kết nối: {str(e)}", ""
 
-def random_response(message, history):
-    return random.choice(["Yes", "No"])
+def get_response_from_bot(message, history):
+    global current_transcript
+    prompt = f"""
+        Hãy trả lời các câu hỏi mà tôi hỏi dựa vào thông tin của 
+        đoạn tóm tắt này, hãy trả lời chính xác, nếu không biết hãy nói không biết
+        và nêu như chưa có cuộc hội thoại hãy báo là bạn chưa có cụôc hội thoại nào 
+        và cuộc thoại đó đây
+
+        {current_transcript}
+
+        câu hỏi đó là {message}
+"""
+
+    try:
+        response = requests.post(
+            f"{API_URL}/chat",
+            json={  # Sửa thành json thay vì form data để gửi cấu trúc phức tạp
+                "prompt": prompt,
+                "model": "llama1",  # Có thể thay đổi model phù hợp cho summarization
+                "stream": False
+            },
+            timeout=300
+        )
+
+        response.raise_for_status()  # Tự động raise exception nếu có lỗi HTTP
+
+        result = response.json()
+
+        # Xử lý response từ API
+        if isinstance(result, dict):
+            return result.get("response", "⚠️ Không nhận được nội dung tóm tắt")
+        elif isinstance(result, str):
+            return result
+        else:
+            return "⚠️ Định dạng response không hợp lệ"
+
+    except requests.exceptions.RequestException as e:
+        return f"⚠️ Lỗi kết nối: {str(e)}"
+    except ValueError as e:
+        return f"⚠️ Lỗi xử lý dữ liệu: {str(e)}"
+    except Exception as e:
+        return f"⚠️ Lỗi không xác định: {str(e)}"
 
 
 def summarization(transcript: str, api_url: str = None) -> str:
@@ -176,7 +216,7 @@ with gr.Blocks(title="Meeting Secretary",fill_height=True) as demo:
                 )
 
                 submit_audio_btn = gr.Button("Transcribe", variant="primary")
-                gr.ChatInterface(random_response, type="messages", autofocus=False,fill_height=True)
+                gr.ChatInterface(get_response_from_bot, type="messages", autofocus=False,fill_height=True,save_history=True)
 
             with gr.Column(scale=4):
                 summarization_box = gr.Textbox(
