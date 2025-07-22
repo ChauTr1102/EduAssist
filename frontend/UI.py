@@ -203,6 +203,22 @@ def summarization_gemini(transcript: str, user_prompt: str) -> str:
     except Exception as e:
         return f"⚠️ Lỗi không xác định: {str(e)}"
 
+def chat_summary_interface(message, history, summarize_script):
+    # Chuẩn hóa history thành text
+    history_str = ""
+    for turn in history:
+        history_str += f"{turn["role"]}: {turn["content"]}\n"
+    payload = {
+        "user_input": message,
+        "history": history_str,
+        "summarize_script": summarize_script,
+    }
+    try:
+        res = requests.post(f"{API_URL}/chat_gemini", json=payload)
+        res.raise_for_status()
+        return res.json()
+    except Exception as e:
+        return f"Error: {e}"
 
 with gr.Blocks(title="Meeting Secretary") as demo:
     with gr.Sidebar(width=200):
@@ -334,7 +350,13 @@ with gr.Blocks(title="Meeting Secretary") as demo:
                     lines=20,
                     interactive=True
                 )
-                gr.ChatInterface(random_response, type="messages", autofocus=False)
+                gr.ChatInterface(
+                    fn=chat_summary_interface,
+                    additional_inputs=on_summarization_box,  # ở tab Online
+                    type="messages",
+                    autofocus=False,
+                    save_history=True
+                )
 
         on_download_box = gr.Textbox(
             label="Downloading audio file",

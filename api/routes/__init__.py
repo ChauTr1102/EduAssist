@@ -50,3 +50,4 @@ class Script(BaseModel):
 class UserInput(BaseModel):
     user_input: str
     summarize_script: str
+    history: str

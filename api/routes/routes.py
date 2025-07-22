@@ -137,8 +137,8 @@ async def summarize_gemini(script: Script):
 
 
 @router.post("/chat_gemini")
-async def summarize_gemini(user_input: UserInput):
-    prompt = model_llm.prompt_qa_script(user_input.user_input, user_input.summarize_script)
+async def chat_gemini(user_input: UserInput):
+    prompt = model_llm.prompt_qa_script(user_input.user_input, user_input.summarize_script, user_input.history)
     result = await model_llm.send_message_gemini(prompt)
     return result
 

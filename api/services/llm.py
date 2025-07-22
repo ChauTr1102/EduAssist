@@ -16,16 +16,18 @@ class LLM:
         prompt = prompt_summarize_template.format(script=script)
         return prompt
 
-    def prompt_qa_script(self, user_input, summarize_script):
+    def prompt_qa_script(self, user_input, summarize_script, history):
         prompt_qa_template = ChatPromptTemplate.from_messages(
             [
                 ("system", f"{PROMPT_QA}\n"),
                 ("system", "Bản tóm tắt cuộc họp:\n"),
                 ("system", "{summarize_script}\n"),
+                ("system", "Lịch sử cuộc trò chuyện:\n"),
+                ("system", "{history}\n"),
                 ("system", "Hãy trả lời câu hỏi của người dùng: {user_input}\n"),
             ]
         )
-        prompt = prompt_qa_template.format(summarize_script=summarize_script, user_input=user_input)
+        prompt = prompt_qa_template.format(summarize_script=summarize_script,  history=history, user_input=user_input)
         return prompt
 
     async def send_message_gemini(self, prompt: str) -> str:
