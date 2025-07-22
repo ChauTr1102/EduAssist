@@ -181,8 +181,7 @@ def summarization_gemini(transcript: str, user_prompt: str) -> str:
             f"{API_URL}/summarize_gemini",
             json={  # Sửa thành json thay vì form data để gửi cấu trúc phức tạp
                 "script": prompt,
-            },
-            timeout=30
+            }
         )
 
         response.raise_for_status()  # Tự động raise exception nếu có lỗi HTTP
@@ -219,9 +218,15 @@ with gr.Blocks(title="Meeting Secretary") as demo:
                     label="Audio Input",
                     interactive=True
                 )
-                submit_btn = gr.Button("Transcribe", variant="primary")
+                submit_audio_btn = gr.Button("Transcribe", variant="primary")
 
-                gr.ChatInterface(random_response, type="messages", autofocus=False)
+                video_input = gr.Video(
+                    sources=["upload", "webcam"],
+                    label="upload or capture video",
+                    interactive=True,
+                    height=200
+                )
+                submit_video_btn = gr.Button("Transcribe", variant="primary")
 
             with gr.Column(scale=4):
                 prompt_box = gr.Textbox(
@@ -234,7 +239,7 @@ with gr.Blocks(title="Meeting Secretary") as demo:
                 summarization_box = gr.Textbox(
                     label="Summarization",
                     placeholder="Your Summarization will appear here...",
-                    lines=15,
+                    lines=38,
                     interactive=True
                 )
                 summarise_btn = gr.Button("Summarise Again", variant="secondary")
@@ -243,10 +248,19 @@ with gr.Blocks(title="Meeting Secretary") as demo:
                 output_text = gr.Textbox(
                     label="Transcription",
                     placeholder="Your transcription will appear here...",
-                    lines=15,
+                    lines=20,
                     interactive=True
                 )
-    submit_btn.click(
+
+                gr.ChatInterface(random_response, type="messages", autofocus=False)
+
+        download_box = gr.Textbox(
+            label="Downloading audio file",
+            placeholder="Your file is store in here",
+            interactive=True,
+        )
+
+    submit_audio_btn.click(
         fn=get_transcribe,
         inputs=audio_input,
         outputs=output_text
@@ -254,6 +268,19 @@ with gr.Blocks(title="Meeting Secretary") as demo:
         fn=summarization,
         inputs=[output_text, prompt_box],
         outputs=summarization_box
+    )
+    submit_video_btn.click(
+        fn=extract_video_to_audio,
+        inputs=video_input,
+        outputs=download_box
+    ).then(
+        fn=get_transcribe,
+        inputs=download_box,
+        outputs=output_text
+    ).then(
+        fn = summarization,
+         inputs =[output_text, prompt_box],
+        outputs = summarization_box
     )
 
     # Bấm Summarise Again
@@ -272,9 +299,16 @@ with gr.Blocks(title="Meeting Secretary") as demo:
                     label="Audio Input",
                     interactive=True
                 )
-                on_submit_btn = gr.Button("Transcribe", variant="primary")
+                on_submit_audio_btn = gr.Button("Transcribe", variant="primary")
 
-                gr.ChatInterface(random_response, type="messages", autofocus=False)
+                on_video_input = gr.Video(
+                    sources=["upload", "webcam"],
+                    label="upload or capture video",
+                    interactive=True,
+                    height=200
+                )
+                on_submit_video_btn = gr.Button("Transcribe", variant="primary")
+
 
             with gr.Column(scale=4):
                 on_prompt_box = gr.Textbox(
@@ -287,20 +321,27 @@ with gr.Blocks(title="Meeting Secretary") as demo:
                 on_summarization_box = gr.Textbox(
                     label="Summarization",
                     placeholder="Your Summarization will appear here...",
-                    lines=15,
+                    lines=38,
                     interactive=True
                 )
                 on_summarise_btn = gr.Button("Summarise Again", variant="secondary")
+
 
             with gr.Column(scale=2):
                 on_output_text = gr.Textbox(
                     label="Transcription",
                     placeholder="Your transcription will appear here...",
-                    lines=15,
+                    lines=20,
                     interactive=True
                 )
+                gr.ChatInterface(random_response, type="messages", autofocus=False)
 
-    on_submit_btn.click(
+        on_download_box = gr.Textbox(
+            label="Downloading audio file",
+            placeholder="Your file is store in here",
+            interactive=True,
+        )
+    on_submit_audio_btn.click(
         fn=get_transcribe,
         inputs=on_audio_input,
         outputs=on_output_text
@@ -309,6 +350,19 @@ with gr.Blocks(title="Meeting Secretary") as demo:
         inputs=[on_output_text, on_prompt_box],
         outputs=on_summarization_box
     )
+    on_submit_video_btn.click(
+        fn=extract_video_to_audio,
+        inputs=on_video_input,
+        outputs=on_download_box
+    ).then(
+        fn=get_transcribe,
+        inputs=on_download_box,
+        outputs=on_output_text
+    ).then(
+        fn = summarization,
+        inputs =[on_output_text, on_prompt_box],
+        outputs = on_summarization_box
+    )
 
     # Bấm Summarise Again
     on_summarise_btn.click(
@@ -316,6 +370,7 @@ with gr.Blocks(title="Meeting Secretary") as demo:
         inputs=[on_output_text, on_prompt_box],
         outputs=on_summarization_box
     )
+
 
 
 if __name__ == "__main__":
