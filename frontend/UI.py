@@ -99,15 +99,15 @@ def get_transcribe(audio_path: str):
     except Exception as e:
         return f"⚠️ Lỗi kết nối: {str(e)}", ""
 
-def get_response_from_bot(message, history):
-    global current_transcript
+def get_response_from_bot(message, history,transcript):
+
     prompt = f"""
         Hãy trả lời các câu hỏi mà tôi hỏi dựa vào thông tin của 
         đoạn tóm tắt này, hãy trả lời chính xác, nếu không biết hãy nói không biết
         và nêu như chưa có cuộc hội thoại hãy báo là bạn chưa có cụôc hội thoại nào 
         và cuộc thoại đó đây
 
-        {current_transcript}
+        {transcript}
 
         câu hỏi đó là {message}
 """
@@ -216,7 +216,7 @@ with gr.Blocks(title="Meeting Secretary",fill_height=True) as demo:
                 )
 
                 submit_audio_btn = gr.Button("Transcribe", variant="primary")
-                gr.ChatInterface(get_response_from_bot, type="messages", autofocus=False,fill_height=True,save_history=True)
+                gr.ChatInterface(get_response_from_bot,transcript = current_transcript, type="messages", autofocus=False,fill_height=True,save_history=True)
 
             with gr.Column(scale=4):
                 summarization_box = gr.Textbox(

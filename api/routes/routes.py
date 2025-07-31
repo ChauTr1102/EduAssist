@@ -9,7 +9,7 @@ import httpx
 router = APIRouter()
 
 # Khởi tạo model với thư mục tùy chỉnh
-model_stt = FasterWhisper("large-v3", models_dir="models")
+model_stt = FasterWhisper("medium", models_dir="models")
 
 
 @router.get("/")
