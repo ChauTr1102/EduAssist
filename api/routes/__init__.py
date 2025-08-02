@@ -5,7 +5,6 @@ from dotenv import load_dotenv
 import tempfile
 from api.services.whisper import FasterWhisper
 from api.services.llm import LLM
-# from phobert_ollama_text_summarization import VietnameseSummarizationPipeline
 import logging
 import time
 from datetime import datetime

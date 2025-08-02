@@ -11,15 +11,6 @@ logger = logging.getLogger(__name__)
 # Initialize router
 router = APIRouter()
 
-# Initialize the summarization pipeline
-logger.info("Initializing Vietnamese Summarization Pipeline...")
-try:
-    pipeline = VietnameseSummarizationPipeline()
-    logger.info("Pipeline initialized successfully!")
-except Exception as e:
-    logger.error(f"Failed to initialize pipeline: {e}")
-    pipeline = None
-
 
 model_stt = FasterWhisper("large-v3")
 model_llm = LLM(os.getenv("API_KEY"))
@@ -66,48 +57,6 @@ async def speech_to_text(audio_path: str = Form(...)):
         raise HTTPException(
             status_code=500,
             detail=f"Lỗi khi xử lý audio: {str(e)}"
-        )
-
-# Summarization endpoint
-@router.post("/summarize", response_model=SummarizeResponse, responses={503: {"model": ErrorResponse}, 400: {"model": ErrorResponse}})
-async def summarize(request: SummarizeRequest):
-    """
-    Summarize Vietnamese text using the complete pipeline.
-    1. Vietnamese text → English translation
-    2. English text → English summary (using Ollama LLM)
-    3. English summary → Vietnamese summary
-    """
-    if not pipeline:
-        raise HTTPException(
-            status_code=503,
-            detail={
-                "success": False,
-                "error": "Pipeline not initialized",
-                "timestamp": datetime.now().isoformat()
-            }
-        )
-    try:
-        start_time = time.time()
-        logger.info("Processing Vietnamese text through summarization pipeline...")
-        results = pipeline.process(request.text.strip(), request.summary_length)
-        processing_time = time.time() - start_time
-        response = SummarizeResponse(
-            success=True,
-            summary=results['vietnamese_summary'],
-            processing_time=round(processing_time, 2),
-            timestamp=datetime.now().isoformat()
-        )
-        logger.info(f"Summarization completed successfully in {processing_time:.2f} seconds")
-        return response
-    except Exception as e:
-        logger.error(f"Summarization pipeline failed: {e}")
-        raise HTTPException(
-            status_code=500,
-            detail={
-                "success": False,
-                "error": str(e),
-                "timestamp": datetime.now().isoformat()
-            }
         )
 
 
