@@ -210,3 +210,5 @@ models
 test_data
 
 test_function
+
+.gradio
