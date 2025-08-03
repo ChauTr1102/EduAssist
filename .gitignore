@@ -209,6 +209,6 @@ models
 
 test_data
 
-test_function
+test_function/temp_chunk.wav
 
 .gradio

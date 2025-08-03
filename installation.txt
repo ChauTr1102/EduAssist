@@ -27,3 +27,8 @@ lưu ý phải tải đúng libcudnn8 libcudnn8 or 9 thì moiwschayj được
 
 
 apt-get install portaudio19-dev
+
+
+realtime stt
+sudo apt-get install libasound-dev portaudio19-dev libportaudio2 libportaudiocpp0
+sudo apt-get install ffmpeg libav-tools
