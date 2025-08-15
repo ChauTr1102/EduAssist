@@ -98,7 +98,6 @@ def transcriber():
 
                 chunk_counter += 1
 
-
 # Start threads
 threading.Thread(target=recorder, daemon=True).start()
 transcriber()
