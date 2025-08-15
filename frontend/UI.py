@@ -5,7 +5,6 @@ import os
 import random
 from typing import Optional
 
-
 current_transcript = ""
 
 # Cấu hình API
@@ -444,7 +443,6 @@ with gr.Blocks(title="Meeting Secretary") as demo:
         inputs=[on_output_text, on_prompt_box],
         outputs=on_summarization_box
     )
-
 
 
 if __name__ == "__main__":
