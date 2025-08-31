@@ -32,3 +32,7 @@ apt-get install portaudio19-dev
 realtime stt
 sudo apt-get install libasound-dev portaudio19-dev libportaudio2 libportaudiocpp0
 sudo apt-get install ffmpeg libav-tools
+
+
+git clone https://github.com/khanld/chunkformer.git
+pip install - chunkformer/requirements.txt
