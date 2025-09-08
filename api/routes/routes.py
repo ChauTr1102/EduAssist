@@ -14,7 +14,7 @@ router = APIRouter()
 
 model_stt = FasterWhisper("large-v3")
 model_llm = LLM(os.getenv("API_KEY"))
-
+chunkformer_stt = Chunkformer()
 @router.get("/", response_model=APIInfo)
 async def home():
     return "Hello hehe"
@@ -45,7 +45,7 @@ async def speech_to_text(audio_path: str = Form(...)):
 
     try:
         # Xử lý audio trực tiếp từ file path
-        result = model_stt.extract_text(audio_path)
+        result = chunkformer_stt.run_chunkformer_stt(audio_path)
 
         return JSONResponse(content={
             "success": True,
