@@ -12,12 +12,18 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
-model_stt = FasterWhisper("large-v3")
+# model_stt = FasterWhisper("large-v3")
 model_llm = LLM(os.getenv("API_KEY"))
 chunkformer_stt = Chunkformer()
 @router.get("/", response_model=APIInfo)
 async def home():
     return "Hello hehe"
+
+
+import time
+from fastapi import APIRouter, Form, HTTPException
+from fastapi.responses import JSONResponse
+import os
 
 
 @router.post("/stt")
@@ -44,13 +50,21 @@ async def speech_to_text(audio_path: str = Form(...)):
         )
 
     try:
+        # Bắt đầu đo thời gian
+        start_time = time.time()
+
         # Xử lý audio trực tiếp từ file path
         result = chunkformer_stt.run_chunkformer_stt(audio_path)
+
+        # Kết thúc đo thời gian
+        end_time = time.time()
+        processing_time = round(end_time - start_time, 3)  # làm tròn 3 chữ số thập phân (giây)
 
         return JSONResponse(content={
             "success": True,
             "result": result,
-            "file_path": audio_path  # Trả về path để debug
+            "file_path": audio_path,   # Trả về path để debug
+            "processing_time": processing_time  # Thêm thời gian xử lý
         })
 
     except Exception as e:
