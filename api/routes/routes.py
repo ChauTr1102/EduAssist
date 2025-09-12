@@ -12,9 +12,10 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
-# model_stt = FasterWhisper("large-v3")
+# faster_whisper = FasterWhisper("large-v3")
 model_llm = LLM(os.getenv("API_KEY"))
 chunkformer_stt = Chunkformer()
+
 @router.get("/", response_model=APIInfo)
 async def home():
     return "Hello hehe"
@@ -26,7 +27,7 @@ from fastapi.responses import JSONResponse
 import os
 
 
-@router.post("/stt")
+@router.post("/stt_chunkformer")
 async def speech_to_text(audio_path: str = Form(...)):
     """
     Chuyển đổi audio thành văn bản từ file path
@@ -55,6 +56,54 @@ async def speech_to_text(audio_path: str = Form(...)):
 
         # Xử lý audio trực tiếp từ file path
         result = chunkformer_stt.run_chunkformer_stt(audio_path)
+
+        # Kết thúc đo thời gian
+        end_time = time.time()
+        processing_time = round(end_time - start_time, 3)  # làm tròn 3 chữ số thập phân (giây)
+
+        return JSONResponse(content={
+            "success": True,
+            "result": result,
+            "file_path": audio_path,   # Trả về path để debug
+            "processing_time": processing_time  # Thêm thời gian xử lý
+        })
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Lỗi khi xử lý audio: {str(e)}"
+        )
+
+
+@router.post("/stt_faster-whisper")
+async def speech_to_text(audio_path: str = Form(...)):
+    """
+    Chuyển đổi audio thành văn bản từ file path
+    Hỗ trợ định dạng: WAV, MP3, M4A
+    """
+    # Kiểm tra file có tồn tại không
+    if not os.path.exists(audio_path):
+        raise HTTPException(
+            status_code=400,
+            detail=f"File không tồn tại: {audio_path}"
+        )
+
+    # Kiểm tra định dạng file
+    allowed_extensions = ['.wav', '.mp3', '.m4a']
+    file_ext = os.path.splitext(audio_path)[1].lower()
+
+    if file_ext not in allowed_extensions:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Định dạng không hỗ trợ. Hỗ trợ: {', '.join(allowed_extensions)}"
+        )
+
+    try:
+        # Bắt đầu đo thời gian
+        start_time = time.time()
+
+        # Xử lý audio trực tiếp từ file path
+        result = faster_whisper.extract_text(audio_path)
 
         # Kết thúc đo thời gian
         end_time = time.time()
