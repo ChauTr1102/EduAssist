@@ -82,7 +82,7 @@ def get_transcribe(audio_path: str):
 
     try:
         response = requests.post(
-            f"{API_URL}/stt",
+            f"{API_URL}/stt_chunkformer",
             data={"audio_path": audio_path}
         )
 
