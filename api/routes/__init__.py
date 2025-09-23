@@ -15,8 +15,18 @@ import os
 import httpx
 from api.services.local_llm import ChatRequest
 from api.services.video_to_audio_convert import *
+import pynvml
+# import bộ đo GPU
+from api.utils.utils_gpu_mem import GPUMemSampler, detect_device_index
 
 load_dotenv()
+
+def get_gpu_memory_mb(device_index=0):
+    pynvml.nvmlInit()
+    handle = pynvml.nvmlDeviceGetHandleByIndex(device_index)
+    info = pynvml.nvmlDeviceGetMemoryInfo(handle)
+    return info.used / (1024 ** 2)  # MB
+
 
 # Request and Response models for summarization
 class SummarizeRequest(BaseModel):
