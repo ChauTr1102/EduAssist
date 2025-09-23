@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
-# faster_whisper = FasterWhisper("large-v3")
+faster_whisper = FasterWhisper("large-v3")
 model_llm = LLM(os.getenv("API_KEY"))
 chunkformer_stt = Chunkformer()
 
@@ -29,21 +29,14 @@ import os
 
 @router.post("/stt_chunkformer")
 async def speech_to_text(audio_path: str = Form(...)):
-    """
-    Chuyển đổi audio thành văn bản từ file path
-    Hỗ trợ định dạng: WAV, MP3, M4A
-    """
-    # Kiểm tra file có tồn tại không
     if not os.path.exists(audio_path):
         raise HTTPException(
             status_code=400,
             detail=f"File không tồn tại: {audio_path}"
         )
 
-    # Kiểm tra định dạng file
     allowed_extensions = ['.wav', '.mp3', '.m4a']
     file_ext = os.path.splitext(audio_path)[1].lower()
-
     if file_ext not in allowed_extensions:
         raise HTTPException(
             status_code=400,
@@ -51,21 +44,28 @@ async def speech_to_text(audio_path: str = Form(...)):
         )
 
     try:
-        # Bắt đầu đo thời gian
         start_time = time.time()
 
-        # Xử lý audio trực tiếp từ file path
+        # Lấy VRAM trước khi chạy
+        vram_before = get_gpu_memory_mb()
+
         result = chunkformer_stt.run_chunkformer_stt(audio_path)
 
-        # Kết thúc đo thời gian
+        # Lấy VRAM sau khi chạy
+        vram_after = get_gpu_memory_mb()
+
         end_time = time.time()
-        processing_time = round(end_time - start_time, 3)  # làm tròn 3 chữ số thập phân (giây)
+        processing_time = round(end_time - start_time, 3)
+
+        # Tính VRAM trung bình
+        vram_avg = round((vram_before + vram_after) / 2, 2)
 
         return JSONResponse(content={
             "success": True,
             "result": result,
-            "file_path": audio_path,   # Trả về path để debug
-            "processing_time": processing_time  # Thêm thời gian xử lý
+            "file_path": audio_path,
+            "processing_time": processing_time,
+            "gpu_vram_avg_mb": vram_avg
         })
 
     except Exception as e:
@@ -75,20 +75,19 @@ async def speech_to_text(audio_path: str = Form(...)):
         )
 
 
+
 @router.post("/stt_faster-whisper")
 async def speech_to_text(audio_path: str = Form(...)):
     """
     Chuyển đổi audio thành văn bản từ file path
     Hỗ trợ định dạng: WAV, MP3, M4A
     """
-    # Kiểm tra file có tồn tại không
     if not os.path.exists(audio_path):
         raise HTTPException(
             status_code=400,
             detail=f"File không tồn tại: {audio_path}"
         )
 
-    # Kiểm tra định dạng file
     allowed_extensions = ['.wav', '.mp3', '.m4a']
     file_ext = os.path.splitext(audio_path)[1].lower()
 
@@ -99,21 +98,26 @@ async def speech_to_text(audio_path: str = Form(...)):
         )
 
     try:
-        # Bắt đầu đo thời gian
         start_time = time.time()
+        # Đo VRAM trước khi chạy model
+        vram_before = get_gpu_memory_mb()
 
-        # Xử lý audio trực tiếp từ file path
         result = faster_whisper.extract_text(audio_path)
 
-        # Kết thúc đo thời gian
+        # Đo VRAM sau khi chạy model
+        vram_after = get_gpu_memory_mb()
+
         end_time = time.time()
-        processing_time = round(end_time - start_time, 3)  # làm tròn 3 chữ số thập phân (giây)
+        processing_time = round(end_time - start_time, 3)  # làm tròn 3 số lẻ
+
+        vram_avg = round((vram_before + vram_after) / 2, 2)
 
         return JSONResponse(content={
             "success": True,
             "result": result,
-            "file_path": audio_path,   # Trả về path để debug
-            "processing_time": processing_time  # Thêm thời gian xử lý
+            "file_path": audio_path,
+            "processing_time": processing_time,
+            "gpu_vram_avg_mb": vram_avg
         })
 
     except Exception as e:
