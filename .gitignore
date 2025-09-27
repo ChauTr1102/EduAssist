@@ -214,6 +214,6 @@ test_data
 
 audio_output
 
-api/services/chunkformer
+#api/services/chunkformer
 
 api/services/chunkformer-large-vie
