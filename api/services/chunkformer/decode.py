@@ -201,6 +201,9 @@ def batch_decode(args, model, char_dict):
         print("WER: ", wer)
     df.to_csv(args.audio_list, sep="\t", index=False)
 
+@torch.no_grad()
+def realtime_decode():
+    pass
 
 
 def main():
@@ -306,8 +309,8 @@ if __name__ == "__main__":
     sys.argv = [
         "decode.py",
         "--model_checkpoint", "../chunkformer-large-vie",
-        "--long_form_audio", "/home/bojjoo/Code/EduAssist/test_data/test2.wav",
-        # "--audio_list", "/home/bojjoo/Code/EduAssist/api/services/chunkformer/data/audio_list.tsv",
+        # "--long_form_audio", "/home/bojjoo/Code/EduAssist/test_data/test2.wav",
+        "--audio_list", "/home/bojjoo/Code/EduAssist/api/services/chunkformer/data/audio_list.tsv",
         "--total_batch_duration", "2",
         "--chunk_size", "1",
         "--left_context_size", "128",
