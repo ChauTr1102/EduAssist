@@ -309,10 +309,10 @@ if __name__ == "__main__":
     sys.argv = [
         "decode.py",
         "--model_checkpoint", "../chunkformer-large-vie",
-        # "--long_form_audio", "/home/bojjoo/Code/EduAssist/test_data/test2.wav",
-        "--audio_list", "/home/bojjoo/Code/EduAssist/api/services/chunkformer/data/audio_list.tsv",
+        "--long_form_audio", "/home/bojjoo/Code/EduAssist/test_data/giavang.mp3",
+        # "--audio_list", "/home/bojjoo/Code/EduAssist/api/services/chunkformer/data/audio_list.tsv",
         "--total_batch_duration", "2",
-        "--chunk_size", "1",
+        "--chunk_size", "2",
         "--left_context_size", "128",
         "--right_context_size", "2",
         "--device", "cuda",
