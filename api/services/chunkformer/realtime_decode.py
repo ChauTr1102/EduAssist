@@ -26,7 +26,7 @@ def init(model_checkpoint):
 
     with open(config_path, 'r') as fin:
         config = yaml.load(fin, Loader=yaml.FullLoader)
-    model = init_model(config)
+    model = init_model(config,config_path)
     model.eval()
     load_checkpoint(model, checkpoint_path)
 
@@ -478,13 +478,13 @@ if __name__ == "__main__":
 
     # ghi cứng tham số để chạy trực tiếp (streaming từ mic)
     sys.argv = [
-        "decode.py",
+        "realtime_decode.py",
         "--model_checkpoint", "/home/trinhchau/code/chunkformer/chunkformer-large-vie",
         "--mic",
         "--mic_sr", "16000",
-        "--left_context_size", "128",
-        "--right_context_size", "8",
-        "--stream_chunk_sec", "1",
+        "--left_context_size", "64",
+        "--right_context_size", "16",
+        "--stream_chunk_sec", "0.5",
         "--print_final"
     ]
 
