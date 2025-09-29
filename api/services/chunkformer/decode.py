@@ -307,6 +307,7 @@ if __name__ == "__main__":
         "decode.py",
         "--model_checkpoint", "../chunkformer-large-vie",
         "--long_form_audio", "/home/trinhchau/code/EduAssist/data/kinh_te_chinh_tri_2m_47s.MP3",
+
         # "--audio_list", "/home/bojjoo/Code/EduAssist/api/services/chunkformer/data/audio_list.tsv",
         "--total_batch_duration", "2",
         "--chunk_size", "1",
