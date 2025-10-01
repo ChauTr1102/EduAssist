@@ -4,7 +4,7 @@ import time
 import argparse
 from contextlib import nullcontext
 import io
-
+import math
 import torch
 from torch import nn
 import torch.nn.functional as F
@@ -38,7 +38,7 @@ class CIFCfg:
     conv_cif_dropout = 0.1
     apply_scaling = True
     apply_tail_handling = True
-    tail_handling_firing_threshold = 0.4
+    tail_handling_firing_threshold = 0.5
 
 
 # ---------------- Runner: encoder -> CIF -> CTC ----------------
@@ -510,10 +510,15 @@ def ctc_greedy_collapse_with_memory(frame_ids, blank_id, last_nonblank_id):
 def ids_to_text(ids, id2ch):
     return "".join(id2ch[i] for i in ids if i in id2ch)
 
+
+
 @torch.no_grad()
 def stream_infer_with_runner(args):
     """
-    Streaming: encoder -> CIF (tạo chuỗi h1..hU) -> CTC head của encoder -> decode + timestamps (giống legacy).
+    Streaming cố định 0.5s (mặc định) như online ASR:
+    - Mỗi vòng xử lý đúng frames_per_hop = round(stream_hop_sec/10ms)
+    - CIF carry đảm bảo không hụ từ ở rìa hop
+    - Khâu biên CTC bằng last_nonblank_id
     """
     assert args.long_form_audio is not None, "Please provide --long_form_audio for inference."
     assert args.cif_ckpt is not None and os.path.isfile(args.cif_ckpt), "Please provide a valid --cif_ckpt."
@@ -521,65 +526,77 @@ def stream_infer_with_runner(args):
     device = torch.device(args.device)
     model, char_dict = init(args.model_checkpoint, device)
     id2ch, ch2id, blank_id, unk_id = build_char_maps(char_dict)
-    # CIF config khớp encoder dim
+
+    # CIF cfg khớp encoder dim
     cif_cfg = CIFCfg()
     cif_cfg.encoder_embed_dim = model.encoder._output_size
     cif_cfg.cif_embedding_dim = model.encoder._output_size
 
-    # Runner chỉ để lấy self.cif (không dùng cif_ctc)
-    runner = EndlessRunner(model, vocab_size=len(char_dict), blank_id=0, cif_cfg=cif_cfg).to(device)
+    runner = EndlessRunner(model, vocab_size=len(id2ch), blank_id=blank_id, cif_cfg=cif_cfg).to(device)
     maybe_resume_cif(runner, args.cif_ckpt)
     runner.eval()
 
+    # Helper
     def get_max_input_context(c, r, n):
         return r + max(c, r) * (n - 1)
 
-    subsampling_factor = model.encoder.embed.subsampling_factor
-    chunk_size = args.chunk_size
-    left_context_size = args.left_context_size
-    right_context_size = args.right_context_size
+    # Subsampling và hop
+    subsampling_factor = getattr(model.encoder.embed, "subsampling_factor", 4)
+    hop_sec = float(getattr(args, "stream_hop_sec", 0.5))
+    frames_per_hop = max(1, int(round(hop_sec / 0.01)))  # 10ms/frame → 0.5s ≈ 50 frames
+
+    # Chuyển sang đơn vị encoder step
+    chunk_size = max(1, int(math.ceil(frames_per_hop / subsampling_factor)))
+
+    left_context_size = int(args.left_context_size)
+    right_context_size = int(args.right_context_size)
+
     conv_lorder = model.encoder.cnn_module_kernel // 2
 
-    # max length
-    max_length_limited_context = int((args.total_batch_duration // 0.01)) // 2  # in 10ms
-    multiply_n = max(1, max_length_limited_context // chunk_size // subsampling_factor)
-    truncated_context_size = chunk_size * multiply_n
-
-    # relative right context (frames)
+    # Right-context tương đối trên miền input (fbank frames)
     rel_right_context_size = get_max_input_context(
         chunk_size, max(right_context_size, conv_lorder), model.encoder.num_blocks
     ) * subsampling_factor
 
-    # audio -> fbank
+    # Audio → fbank
     waveform = load_audio(args.long_form_audio).to(device)
     xs = kaldi.fbank(
         waveform, num_mel_bins=80, frame_length=25, frame_shift=10,
         dither=0.0, energy_floor=0.0, sample_frequency=16000
     ).unsqueeze(0)  # (1, T_frames, 80)
 
-    # caches
+    T_input = xs.shape[1]
+
+    # Caches encoder
     att_cache = torch.zeros(
-        (model.encoder.num_blocks, left_context_size, model.encoder.attention_heads,
-         model.encoder._output_size * 2 // model.encoder.attention_heads),
-        device=device
+        (
+            model.encoder.num_blocks,
+            left_context_size,
+            model.encoder.attention_heads,
+            model.encoder._output_size * 2 // model.encoder.attention_heads,
+        ),
+        device=device,
     )
     cnn_cache = torch.zeros((model.encoder.num_blocks, model.encoder._output_size, conv_lorder), device=device)
     offset = torch.zeros(1, dtype=torch.int, device=device)
 
+    # CIF carry và CTC boundary memory
     cif_carry = None
-    results = []
-
-    # <<< NEW: nhớ ký tự non-blank cuối cùng xuyên suốt các span & chunk >>>
     last_nonblank_id = None
 
-    for idx, _ in tqdm(list(enumerate(range(0, xs.shape[1], truncated_context_size * subsampling_factor)))):
-        start = max(truncated_context_size * subsampling_factor * idx, 0)
-        end = min(truncated_context_size * subsampling_factor * (idx + 1) + 7, xs.shape[1])
+    results = []
+    GROUP_K = int(getattr(args, "group_k", 2))
 
-        x = xs[:, start:end + rel_right_context_size]
+    # Vòng lặp cố định theo hop
+    start = 0
+    while start < T_input:
+        # vùng input: đúng 1 hop + look-ahead
+        end_core = min(start + frames_per_hop, T_input)
+        end = min(end_core + rel_right_context_size, T_input)
+        x = xs[:, start:end]
         x_len = torch.tensor([x[0].shape[0]], dtype=torch.int, device=device)
 
-        # Encoder streaming
+        # Encode streaming for one hop
         encoder_outs, encoder_lens, _, att_cache, cnn_cache, offset = model.encoder.forward_parallel_chunk(
             xs=x,
             xs_origin_lens=x_len,
@@ -588,84 +605,103 @@ def stream_infer_with_runner(args):
             right_context_size=right_context_size,
             att_cache=att_cache,
             cnn_cache=cnn_cache,
-            truncated_context_size=truncated_context_size,
-            offset=offset
+            truncated_context_size=chunk_size,  # đúng 1 hop trên miền encoder
+            offset=offset,
         )
-        # (1, T_enc, C)
-        encoder_outs = encoder_outs.reshape(1, -1, encoder_outs.shape[-1])[:, :encoder_lens]
-        if truncated_context_size * subsampling_factor * idx + rel_right_context_size < xs.shape[1]:
-            encoder_outs = encoder_outs[:, :truncated_context_size]
-        offset = offset - encoder_lens + encoder_outs.shape[1]
+        # Chuẩn hóa output encoder
+        B, _, C = encoder_outs.shape
+        Tenc = int(encoder_lens if isinstance(encoder_lens, int) else int(encoder_lens.item()))
+        encoder_outs = encoder_outs.reshape(1, -1, C)[:, :Tenc]
 
-        # === CIF từ encoder_outs ===
-        B, Te, _ = encoder_outs.shape
+        is_last = (end_core >= T_input)
+        if not is_last:
+            # chỉ giữ đúng 1 hop encoder step để latency thấp
+            encoder_outs = encoder_outs[:, :chunk_size]
+        offset = offset - Tenc + encoder_outs.shape[1]
+
+        # CIF trên encoder_outs của hop này
+        Te = encoder_outs.shape[1]
         encoder_padding_mask = torch.zeros(1, Te, dtype=torch.bool, device=encoder_outs.device)
         cif_in = {"encoder_raw_out": encoder_outs, "encoder_padding_mask": encoder_padding_mask}
 
-        is_last = (truncated_context_size * subsampling_factor * idx + rel_right_context_size) >= xs.shape[1]
         cif_pack = runner.cif(
             cif_in,
             target_lengths=None,
-            carry=cif_carry,  # truyền carry giữa các chunk
-            flush_tail=is_last  # chỉ flush ở cuối luồng thật
+            carry=cif_carry,
+            flush_tail=is_last,
         )
         cif_carry = cif_pack["carry"]
+        fires = cif_pack["fire_mask_per_frame"][0].bool().tolist()
 
-        fires = cif_pack["fire_mask_per_frame"][0].bool()  # (Te,)
-
-        # =====================[ NEW 1/2: Fire -> spans, rồi gộp K spans ]=====================
-        # Mỗi fire kết thúc một "span" cơ bản. Sau đó gộp K span liên tiếp thành 1 super-span.
+        # spans từ fire
         spans = []
         seg_start = 0
-        for i, f in enumerate(fires.tolist()):
+        for i, f in enumerate(fires):
             if f:
-                spans.append((seg_start, i))  # inclusive
+                spans.append((seg_start, i))
                 seg_start = i + 1
-        # Nếu còn đuôi chưa fire mà đây là cuối luồng thật, đã flush_tail ở trên để sinh fire cuối.
-        # Nhưng để an toàn: nếu vẫn còn phần dư và is_last==True, coi phần dư là một span cuối.
         if is_last and seg_start <= Te - 1 and (len(spans) == 0 or spans[-1][1] < Te - 1):
             spans.append((seg_start, Te - 1))
 
-        # Gộp K spans -> super-spans
-        GROUP_K = 10  # thử 2 hoặc 3
+        # gộp K spans → super-spans
         super_spans = []
-        if len(spans) > 0:
+        if spans:
             for i in range(0, len(spans), GROUP_K):
                 s = spans[i][0]
                 e = spans[min(i + GROUP_K - 1, len(spans) - 1)][1]
                 if e >= s:
                     super_spans.append((s, e))
 
-        # =====================[ NEW 2/2: Decode từng SUPER-SPAN + khâu biên ]=================
+        # decode từng super-span và khâu biên CTC
+        hop_text_parts = []
         for (s, e) in super_spans:
-            if e < s:
-                continue
+            seg_feats = encoder_outs[:, s : e + 1, :]
+            hyp_ids_frame = model.encoder.ctc_forward(seg_feats).squeeze(0)
 
-            seg_feats = encoder_outs[:, s:e + 1, :]  # (1, L, C)
-            hyp_ids_frame = model.encoder.ctc_forward(seg_feats).squeeze(0)  # (L,)
-
-            # Greedy collapse (ID) + khâu biên với bộ nhớ xuyên super-span/chunk
             out_ids, last_nonblank_id = ctc_greedy_collapse_with_memory(
                 frame_ids=hyp_ids_frame,
                 blank_id=blank_id,
-                last_nonblank_id=last_nonblank_id
+                last_nonblank_id=last_nonblank_id,
             )
-
             if not out_ids:
                 continue
-
             text = ids_to_text(out_ids, id2ch)
-            # detok SP: '▁' -> ' ', gom nhiều khoảng trắng
             text = re.sub(r"\s+", " ", text.replace("▁", " ")).strip()
             if text:
-                print(text)
-                results.append(text)
+                hop_text_parts.append(text)
 
-        if is_last:
-            break
+        # In đúng mỗi hop 0.5s một lần (kể cả rỗng)
+        def _fmt_ts(fr):
+            ms = int(fr * 10)
+            h = ms // 3_600_000; ms %= 3_600_000
+            m = ms // 60_000;    ms %= 60_000
+            s = ms // 1_000;     ms %= 1_000
+            return f"{h:02d}:{m:02d}:{s:02d}:{ms:03d}"
+
+        hop_text = re.sub(r"\s+", " ", " ".join(hop_text_parts)).strip()
+        ts_line = f"{_fmt_ts(start)} - {_fmt_ts(end_core)}: {hop_text}"
+        print(ts_line)
+        results.append(ts_line)
+
+        # tiến con trỏ theo đúng hop
+        start = end_core
+
     return results
 
-
+# (D) Gợi ý chạy (sys.argv ví dụ):
+# sys.argv = [
+#     "infer_cif_stream.py",
+#     "--model_checkpoint", "/path/to/chunkformer-large-vie",
+#     "--device", "cuda",
+#     "--autocast_dtype", "fp16",
+#     "--infer_cif",
+#     "--cif_ckpt", "/path/to/cif_best.pt",
+#     "--long_form_audio", "/path/to/audio.wav",
+#     "--stream_hop_sec", "0.5",
+#     "--left_context_size", "64",
+#     "--right_context_size", "8",
+#     "--group_k", "2",
+# ]
 
 
 
@@ -694,6 +730,9 @@ def main():
     parser.add_argument("--infer_cif", action="store_true", help="Run streaming inference with CIF checkpoint")
     parser.add_argument("--cif_ckpt", type=str, default=None)
     parser.add_argument("--long_form_audio", type=str, default=None)
+
+    parser.add_argument("--stream_hop_sec", type=float, default=0.5)
+    parser.add_argument("--group_k", type=int, default=2)
 
     # legacy decode (frame-CTC)
     parser.add_argument("--legacy_decode", action="store_true", help="Run legacy streaming decode (frame CTC)")
@@ -746,18 +785,20 @@ if __name__ == "__main__":
     #     "--right_context_size", "2",
     # ]
 
+
+    # (D) Gợi ý chạy (sys.argv ví dụ):
     sys.argv = [
-        "infer_cif_stream.py",
-        "--model_checkpoint", "/home/trinhchau/code/EduAssist/api/services/chunkformer-large-vie",
-        "--device", "cuda",
-        "--autocast_dtype", "fp16",
-        "--infer_cif",
-        "--cif_ckpt", "/home/trinhchau/code/EduAssist/cif_best.pt",
-        "--long_form_audio", "/home/trinhchau/code/EduAssist/data/AI_voice_2p.wav",
-        "--total_batch_duration", "2",
-        "--chunk_size", "2",
-        "--left_context_size", "2",
-        "--right_context_size", "2",
+    "infer_cif_stream.py",
+    "--model_checkpoint", "/home/trinhchau/code/EduAssist/api/services/chunkformer-large-vie",
+    "--device", "cuda",
+    "--autocast_dtype", "fp32",
+    "--infer_cif",
+    "--cif_ckpt", "/home/trinhchau/code/EduAssist/cif_best.pt",
+    "--long_form_audio", "/home/trinhchau/code/EduAssist/data/AI_voice_2p.wav",
+    "--stream_hop_sec", "1",
+    "--left_context_size", "32",
+    "--right_context_size", "8",
+    "--group_k", "3",
     ]
 
     main()
