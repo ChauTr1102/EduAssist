@@ -795,10 +795,10 @@ if __name__ == "__main__":
     "--infer_cif",
     "--cif_ckpt", "/home/trinhchau/code/EduAssist/cif_best.pt",
     "--long_form_audio", "/home/trinhchau/code/EduAssist/data/AI_voice_2p.wav",
-    "--stream_hop_sec", "1",
-    "--left_context_size", "32",
-    "--right_context_size", "8",
-    "--group_k", "3",
+    "--stream_hop_sec", "0.5",
+    "--left_context_size", "2",
+    "--right_context_size", "2",
+    "--group_k", "2",
     ]
 
     main()
