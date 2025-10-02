@@ -33,7 +33,7 @@ train_config=conf/v0.yaml
 checkpoint=
 
 #/home/bojjoo/.cache/huggingface/hub/models--khanhld--chunkformer-large-vie/snapshots/8f5a52a3fa04479b13a51dd4274bc41dee06527b/pytorch_model.bin
-num_workers=4
+num_workers=1
 
 dir=exp/v0
 tensorboard_dir=tensorboard
@@ -125,34 +125,51 @@ if [ ${stage} -le 3 ] && [ ${stop_stage} -ge 3 ]; then
   # export later
 
   echo "$0: num_nodes is $num_nodes, proc_per_node is $num_gpus"
-  torchrun --nnodes=$num_nodes --nproc_per_node=$num_gpus --rdzv_endpoint=$HOST_NODE_ADDR \
-           --rdzv_id=$job_id --rdzv_backend="c10d" \
-    chunkformer/bin/train.py \
-      --use_amp \
-      --train_engine ${train_engine} \
-      --config $train_config \
-      --data_type ${data_type} \
-      --train_data $wave_data/$train_set/data.list \
-      --cv_data $wave_data/$dev_set/data.list \
-      ${checkpoint:+--checkpoint $checkpoint} \
-      --model_dir $dir \
-      --tensorboard_dir ${tensorboard_dir} \
-      --ddp.dist_backend $dist_backend \
-      --num_workers ${num_workers} \
-      --pin_memory
+  # torchrun --nnodes=$num_nodes --nproc_per_node=$num_gpus --rdzv_endpoint=$HOST_NODE_ADDR \
+  #          --rdzv_id=$job_id --rdzv_backend="c10d" \
+  #   chunkformer/bin/train.py \
+  #     --use_amp \
+  #     --train_engine ${train_engine} \
+  #     --config $train_config \
+  #     --data_type ${data_type} \
+  #     --train_data $wave_data/$train_set/data.list \
+  #     --cv_data $wave_data/$dev_set/data.list \
+  #     ${checkpoint:+--checkpoint $checkpoint} \
+  #     --model_dir $dir \
+  #     --tensorboard_dir ${tensorboard_dir} \
+  #     --ddp.dist_backend $dist_backend \
+  #     --num_workers ${num_workers} \
+  #     --pin_memory
+  torchrun --standalone --nnodes=1 --nproc_per_node=$num_gpus \
+  chunkformer/bin/train.py \
+    --train_engine ${train_engine} \
+    --config $train_config \
+    --data_type ${data_type} \
+    --train_data $wave_data/$train_set/data.list \
+    --cv_data $wave_data/$dev_set/data.list \
+    ${checkpoint:+--checkpoint $checkpoint} \
+    --model_dir $dir \
+    --tensorboard_dir ${tensorboard_dir} \
+    --ddp.dist_backend nccl \
+    --num_workers ${num_workers} \
+    --pin_memory \
+    ${USE_AMP:+--use_amp}
+
 fi
 
 if [ ${stage} -le 4 ] && [ ${stop_stage} -ge 4 ]; then
   # Test model, please specify the model you want to test by --checkpoint
   # TODO, Add model average here
   mkdir -p $dir/test
+  NUM=$(ls -1 exp/v0/epoch_*.pt 2>/dev/null | wc -l)
+  echo "Found $NUM checkpoints"
   if [ ${average_checkpoint} == true ]; then
-    decode_checkpoint=$dir/avg_${average_num}.pt
+    decode_checkpoint=$dir/avg_${NUM}.pt
     echo "do model average and final checkpoint is $decode_checkpoint"
     python chunkformer/bin/average_model.py \
       --dst_model $decode_checkpoint \
       --src_path $dir  \
-      --num ${average_num}
+      --num ${NUM}
   fi
   # Specify decoding_chunk_size if it's a unified dynamic chunk trained model
   # -1 for full chunk
@@ -191,20 +208,22 @@ if [ ${stage} -le 5 ] && [ ${stop_stage} -ge 5 ]; then
   # Setting Up Model for Inference
   echo "stage 5: Setting up model for ChunkFormer inference"
   # Step 0: Recreate average checkpoint if needed
+  NUM=$(ls -1 exp/v0/epoch_*.pt 2>/dev/null | wc -l)
+
   if [ ${average_checkpoint} == true ]; then
-    decode_checkpoint=$dir/avg_${average_num}.pt
+    decode_checkpoint=$dir/avg_${NUM}.pt
     echo "do model average and final checkpoint is $decode_checkpoint"
     python chunkformer/bin/average_model.py \
       --dst_model $decode_checkpoint \
       --src_path $dir  \
-      --num ${average_num}
+      --num ${NUM}
   fi
 
 
   # Step 1: Determine checkpoint and create appropriate directory name
   if [ ${average_checkpoint} == true ]; then
-    source_checkpoint=$dir/avg_${average_num}.pt
-    checkpoint_name="avg_${average_num}"
+    source_checkpoint=$dir/avg_${NUM}.pt
+    checkpoint_name="avg_${NUM}"
   else
     source_checkpoint=$dir/final.pt
     checkpoint_name="final"
