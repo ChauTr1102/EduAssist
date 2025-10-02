@@ -484,8 +484,7 @@ if __name__ == "__main__":
         "--mic_sr", "16000",
         "--left_context_size", "64",
         "--right_context_size", "16",
-        "--stream_chunk_sec", "0.5",
+        "--stream_chunk_sec", "1",
         "--print_final"
     ]
-
     main()

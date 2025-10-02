@@ -511,9 +511,10 @@ def ids_to_text(ids, id2ch):
     return "".join(id2ch[i] for i in ids if i in id2ch)
 
 
-
+emp = []
 @torch.no_grad()
 def stream_infer_with_runner(args):
+
     """
     Streaming cố định 0.5s (mặc định) như online ASR:
     - Mỗi vòng xử lý đúng frames_per_hop = round(stream_hop_sec/10ms)
@@ -589,6 +590,7 @@ def stream_infer_with_runner(args):
 
     # Vòng lặp cố định theo hop
     start = 0
+
     while start < T_input:
         # vùng input: đúng 1 hop + look-ahead
         end_core = min(start + frames_per_hop, T_input)
@@ -681,11 +683,12 @@ def stream_infer_with_runner(args):
         hop_text = re.sub(r"\s+", " ", " ".join(hop_text_parts)).strip()
         ts_line = f"{_fmt_ts(start)} - {_fmt_ts(end_core)}: {hop_text}"
         print(ts_line)
+        emp.append(hop_text)
         results.append(ts_line)
 
         # tiến con trỏ theo đúng hop
         start = end_core
-
+    print(' '.join(emp))
     return results
 
 # (D) Gợi ý chạy (sys.argv ví dụ):
@@ -785,8 +788,24 @@ if __name__ == "__main__":
     #     "--right_context_size", "2",
     # ]
 
+    #
+    # # # (D) Gợi ý chạy (sys.argv ví dụ):
+    # sys.argv = [
+    # "infer_cif_stream.py",
+    # "--model_checkpoint", "/home/trinhchau/code/EduAssist/api/services/chunkformer-large-vie",
+    # "--device", "cuda",
+    # "--autocast_dtype", "fp32",
+    # "--infer_cif",
+    # "--cif_ckpt", "/home/trinhchau/code/EduAssist/cif_best.pt",
+    # "--long_form_audio", "/home/trinhchau/code/EduAssist/data/AI_voice_2p.wav",
+    # "--stream_hop_sec", "1",
+    # "--left_context_size", "32",
+    # "--right_context_size", "2",
+    # "--group_k", "2",
+    # ]
+    # main()
 
-    # (D) Gợi ý chạy (sys.argv ví dụ):
+
     sys.argv = [
     "infer_cif_stream.py",
     "--model_checkpoint", "/home/trinhchau/code/EduAssist/api/services/chunkformer-large-vie",
@@ -795,10 +814,9 @@ if __name__ == "__main__":
     "--infer_cif",
     "--cif_ckpt", "/home/trinhchau/code/EduAssist/cif_best.pt",
     "--long_form_audio", "/home/trinhchau/code/EduAssist/data/AI_voice_2p.wav",
-    "--stream_hop_sec", "0.5",
-    "--left_context_size", "2",
+    "--stream_hop_sec", "1",
+    "--left_context_size", "32",
     "--right_context_size", "2",
     "--group_k", "2",
     ]
-
     main()
