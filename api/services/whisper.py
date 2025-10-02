@@ -23,7 +23,7 @@ class FasterWhisper:
         self.model = WhisperModel(
             model_name,
             device="cuda",
-            compute_type="int8_float16",
+            compute_type="float16",
             download_root=self.models_dir,
             local_files_only=False  # Tự động tải nếu chưa có
         )

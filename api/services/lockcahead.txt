@@ -1,0 +1,85 @@
+Dùng lookahead = n giây cho mỗi khối 0.5 s. Sửa đúng 4 chỗ sau.
+
+1) Thêm tham số CLI
+
+Trong argparse:
+
+parser.add_argument("--lookahead_sec", type=float, default=0.2, help="Extra audio for right-context")
+
+2) stream_audio(...): thêm và dùng lookahead
+
+Tìm đoạn cắt seg và thay như sau:
+
+# trước đây (không lookahead):
+# seg_end = min(cur + hop_samples, waveform.size(1))
+# seg = waveform[:, cur:seg_end]
+
+# thay bằng:
+seg_end = min(cur + hop_samples, waveform.size(1))
+lookahead_samples = int(args.lookahead_sec * sample_rate)
+seg_end_with_look = min(seg_end + lookahead_samples, waveform.size(1))
+seg = waveform[:, cur:seg_end_with_look]
+
+
+Giữ nguyên phần còn lại. Không cần đổi logic in timestamp.
+
+Gợi ý: đặt --right_context_size > 0 để mặt nạ attention khớp với việc bạn cấp lookahead.
+
+3) stream_mic(...): thêm và dùng lookahead
+
+Ngay đầu hàm, sau khi tính block_samples:
+
+block_samples = int(args.stream_chunk_sec * sr)
+lookahead_samples = int(args.lookahead_sec * sr)
+from collections import deque
+la_buf = deque(maxlen=lookahead_samples)
+
+
+Ở vòng lặp đọc micro, thay phần tạo seg:
+
+audio_block, _ = stream.read(block_samples)   # (N, 1)
+a = np.squeeze(audio_block, axis=1).astype(np.float32)  # (N,)
+
+# cập nhật buffer lookahead
+for s in a:
+    la_buf.append(s)
+
+# ghép block hiện tại + bản copy lookahead
+if lookahead_samples > 0:
+    la_np = np.array(la_buf, dtype=np.float32)
+    seg_np = np.concatenate([a, la_np[:lookahead_samples]])
+else:
+    seg_np = a
+
+seg = torch.from_numpy(seg_np).unsqueeze(0).to(device) * (1 << 15)
+
+4) Gọi với tham số
+
+Ví dụ audio-file:
+
+python decode.py \
+  --model_checkpoint /path/to/chunkformer-large-vie \
+  --long_form_audio /path/to/audio.wav \
+  --left_context_size 128 \
+  --right_context_size 128 \
+  --stream_chunk_sec 0.5 \
+  --lookahead_sec 0.2 \
+  --print_final
+
+
+Ví dụ micro:
+
+python decode.py \
+  --model_checkpoint /path/to/chunkformer-large-vie \
+  --mic --mic_sr 16000 \
+  --left_context_size 128 \
+  --right_context_size 128 \
+  --stream_chunk_sec 0.5 \
+  --lookahead_sec 0.2
+
+
+Lưu ý ngắn:
+
+lookahead_sec tăng độ ổn định nhưng cũng tăng độ trễ = lookahead_sec.
+
+Để khớp huấn luyện, nên đặt --right_context_size ở mức đã dùng khi train (ví dụ 128).
