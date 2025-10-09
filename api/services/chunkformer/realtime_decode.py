@@ -1,15 +1,13 @@
 import os, math, argparse, yaml, re
-import torch, torchaudio, pandas as pd, jiwer
+import torch, torchaudio
 import numpy as np
 from collections import deque
-from tqdm import tqdm
-from colorama import Fore, Style
 import torchaudio.compliance.kaldi as kaldi
 
 from model.utils.init_model import init_model
 from model.utils.checkpoint import load_checkpoint
 from model.utils.file_utils import read_symbol_table
-from model.utils.ctc_utils import get_output_with_timestamps, get_output, milliseconds_to_hhmmssms
+from model.utils.ctc_utils import get_output, milliseconds_to_hhmmssms
 
 
 # ==================== Text merge & stability ====================
@@ -136,240 +134,6 @@ def init(model_checkpoint):
     return model, char_dict
 
 
-# ==================== Streaming from file ====================
-
-@torch.no_grad()
-def stream_audio(args, model, char_dict):
-    device = torch.device("cuda")
-    subsampling = model.encoder.embed.subsampling_factor
-    num_layers = model.encoder.num_blocks
-    conv_lorder = model.encoder.cnn_module_kernel // 2
-
-    # encoder steps từ thời lượng khối
-    enc_steps = max(1, int(round((args.stream_chunk_sec / 0.01) / subsampling)))
-    chunk_size = enc_steps
-
-    left_context_size = args.left_context_size
-    right_context_size = args.right_context_size
-
-    # cache
-    att_cache = torch.zeros(
-        (num_layers, left_context_size, model.encoder.attention_heads,
-         model.encoder._output_size * 2 // model.encoder.attention_heads),
-        device=device
-    )
-    cnn_cache = torch.zeros((num_layers, model.encoder._output_size, conv_lorder), device=device)
-    offset = torch.zeros(1, dtype=torch.int, device=device)
-
-    # audio
-    wav_path = args.long_form_audio
-    waveform, sr = torchaudio.load(wav_path)
-    if waveform.size(0) > 1:
-        waveform = waveform.mean(dim=0, keepdim=True)
-    if sr != 16000:
-        waveform = torchaudio.functional.resample(waveform, sr, 16000)
-        sr = 16000
-    waveform = waveform * (1 << 15)
-
-    hop = int(args.stream_chunk_sec * sr)
-    look = int(args.lookahead_sec * sr)
-
-    produced_steps = 0
-    carry_text = ""
-    last_chunk_len = 1
-
-    # feature
-    fe = GPUMel80(device, sr) if args.use_gpu_mel else None
-
-    cur = 0
-    while cur < waveform.size(1):
-        end = min(cur + hop, waveform.size(1))
-        end_la = min(end + look, waveform.size(1))
-        seg = waveform[:, cur:end_la]
-
-        if seg.size(1) < int(0.025 * sr):
-            break
-
-        if fe is None:
-            x = _kaldi_fbank_cpu(seg).to(device)
-        else:
-            x = fe(seg.to(device))
-        x_len = torch.tensor([x.size(1)], dtype=torch.int, device=device)
-
-        truncated_context_size = chunk_size
-        with torch.cuda.amp.autocast(dtype=torch.float16):
-            enc_out, enc_len, _, att_cache, cnn_cache, offset = model.encoder.forward_parallel_chunk(
-                xs=x,
-                xs_origin_lens=x_len,
-                chunk_size=chunk_size,
-                left_context_size=left_context_size,
-                right_context_size=right_context_size,
-                att_cache=att_cache,
-                cnn_cache=cnn_cache,
-                truncated_context_size=truncated_context_size,
-                offset=offset
-            )
-            enc_out = enc_out.reshape(1, -1, enc_out.size(-1))[:, :enc_len]
-            if enc_out.size(1) > truncated_context_size:
-                enc_out = enc_out[:, :truncated_context_size]
-            offset = offset - enc_len + enc_out.size(1)
-            hyp_step = model.encoder.ctc_forward(enc_out).squeeze(0).cpu()
-
-        seg_start_ms = int(produced_steps * subsampling * 10)
-        seg_end_ms = int((produced_steps + hyp_step.numel()) * subsampling * 10)
-        produced_steps += hyp_step.numel()
-
-        chunk_text = get_output([hyp_step], char_dict)[0]
-
-        # merge thông minh
-        merged = _smart_merge(carry_text, chunk_text, lcs_window=args.lcs_window, lcs_min=args.lcs_min)
-
-        # dự trữ đuôi thích ứng
-        overlap_used = len(carry_text) + len(chunk_text) - len(merged)
-        overlap_ratio = 0.0 if len(chunk_text) == 0 else max(0.0, min(1.0, overlap_used / max(1, len(chunk_text))))
-        reserve_words = _adaptive_reserve_words(overlap_ratio, base=args.stable_reserve_words, hard=args.stable_reserve_words+1, thresh=args.adaptive_overlap_thresh)
-
-        commit, new_tail = _split_commit_tail(merged, reserve_last_k_words=reserve_words)
-
-        if commit:
-            print(f"{Fore.CYAN}{milliseconds_to_hhmmssms(seg_start_ms)}{Style.RESET_ALL} - {Fore.CYAN}{milliseconds_to_hhmmssms(seg_end_ms)}{Style.RESET_ALL}: {commit.strip()}")
-
-        carry_text = new_tail
-        last_chunk_len = max(1, len(chunk_text))
-        cur = end
-
-    if args.print_final:
-        print(carry_text.strip())
-
-
-# ==================== Endless decode (giữ để so sánh) ====================
-
-@torch.no_grad()
-def endless_decode(args, model, char_dict):
-    wav_path = args.long_form_audio
-    subsampling_factor = model.encoder.embed.subsampling_factor
-    chunk_size = args.chunk_size
-    left_context_size = args.left_context_size
-    right_context_size = args.right_context_size
-    conv_lorder = model.encoder.cnn_module_kernel // 2
-
-    max_length_limited_context = args.max_duration
-    max_length_limited_context = int((max_length_limited_context // 0.01)) // 2  # 10ms frame
-
-    multiply_n = max_length_limited_context // chunk_size // subsampling_factor
-    truncated_context_size = chunk_size * multiply_n
-
-    def get_max_input_context(c, r, n):
-        return r + max(c, r) * (n - 1)
-
-    rel_right_context_size = get_max_input_context(chunk_size, max(right_context_size, conv_lorder), model.encoder.num_blocks)
-    rel_right_context_size = rel_right_context_size * subsampling_factor
-
-    waveform, sample_rate = torchaudio.load(wav_path)
-    waveform = waveform * (1 << 15)
-    offset = torch.zeros(1, dtype=torch.int, device="cuda")
-
-    xs = kaldi.fbank(
-        waveform,
-        num_mel_bins=80,
-        frame_length=25,
-        frame_shift=10,
-        dither=0.0,
-        energy_floor=0.0,
-        sample_frequency=16000
-    ).unsqueeze(0)
-
-    hyps = []
-    att_cache = torch.zeros((model.encoder.num_blocks, left_context_size, model.encoder.attention_heads, model.encoder._output_size * 2 // model.encoder.attention_heads)).cuda()
-    cnn_cache = torch.zeros((model.encoder.num_blocks, model.encoder._output_size, conv_lorder)).cuda()
-
-    for idx, _ in enumerate(range(0, xs.shape[1], truncated_context_size * subsampling_factor)):
-        start = max(truncated_context_size * subsampling_factor * idx, 0)
-        end = min(truncated_context_size * subsampling_factor * (idx + 1) + 7, xs.shape[1])
-
-        x = xs[:, start:end + rel_right_context_size]
-        x_len = torch.tensor([x[0].shape[0]], dtype=torch.int).cuda()
-
-        with torch.cuda.amp.autocast(dtype=torch.float16):
-            enc_out, enc_len, _, att_cache, cnn_cache, offset = model.encoder.forward_parallel_chunk(
-                xs=x,
-                xs_origin_lens=x_len,
-                chunk_size=chunk_size,
-                left_context_size=left_context_size,
-                right_context_size=right_context_size,
-                att_cache=att_cache,
-                cnn_cache=cnn_cache,
-                truncated_context_size=truncated_context_size,
-                offset=offset
-            )
-        enc_out = enc_out.reshape(1, -1, enc_out.size(-1))[:, :enc_len]
-        if chunk_size * multiply_n * subsampling_factor * idx + rel_right_context_size < xs.shape[1]:
-            enc_out = enc_out[:, :truncated_context_size]
-        offset = offset - enc_len + enc_out.size(1)
-
-        hyp = model.encoder.ctc_forward(enc_out).squeeze(0)
-        hyps.append(hyp)
-
-        if chunk_size * multiply_n * subsampling_factor * idx + rel_right_context_size >= xs.shape[1]:
-            break
-
-    hyps = torch.cat(hyps)
-    decode = get_output_with_timestamps([hyps], char_dict)[0]
-    for item in decode:
-        start = f"{Fore.RED}{item['start']}{Style.RESET_ALL}"
-        end = f"{Fore.RED}{item['end']}{Style.RESET_ALL}"
-        print(f"{start} - {end}: {item['decode']}")
-
-
-# ==================== Batch decode (gần như giữ nguyên) ====================
-
-@torch.no_grad()
-def batch_decode(args, model, char_dict):
-    df = pd.read_csv(args.audio_list, sep="\t")
-    max_length_limited_context = args.max_duration
-    max_length_limited_context = int((max_length_limited_context // 0.01)) // 2
-    chunk_size = args.chunk_size
-    left_context_size = args.left_context_size
-    right_context_size = args.right_context_size
-
-    decodes, xs, xs_origin_lens = [], [], []
-    max_frames = max_length_limited_context
-
-    for idx, wav_path in tqdm(enumerate(df['wav'].to_list())):
-        waveform, sample_rate = torchaudio.load(wav_path)
-        waveform = waveform * (1 << 15)
-        x = kaldi.fbank(
-            waveform,
-            num_mel_bins=80, frame_length=25, frame_shift=10,
-            dither=0.0, energy_floor=0.0, sample_frequency=16000
-        )
-        xs.append(x)
-        xs_origin_lens.append(x.shape[0])
-        max_frames -= xs_origin_lens[-1]
-
-        if (max_frames <= 0) or (idx == len(df) - 1):
-            xs_origin_lens = torch.tensor(xs_origin_lens, dtype=torch.int, device="cuda")
-            offset = torch.zeros(len(xs), dtype=torch.int, device="cuda")
-            with torch.cuda.amp.autocast(dtype=torch.float16):
-                enc_out, enc_len, n_chunks, _, _, _ = model.encoder.forward_parallel_chunk(
-                    xs=xs,
-                    xs_origin_lens=xs_origin_lens,
-                    chunk_size=chunk_size,
-                    left_context_size=left_context_size,
-                    right_context_size=right_context_size,
-                    offset=offset
-                )
-            hyps = model.encoder.ctc_forward(enc_out, enc_len, n_chunks)
-            decodes += get_output(hyps, char_dict)
-
-            xs, xs_origin_lens, max_frames = [], [], max_length_limited_context
-
-    df['decode'] = decodes
-    if "txt" in df:
-        print("WER:", jiwer.wer(df["txt"].to_list(), decodes))
-    df.to_csv(args.audio_list, sep="\t", index=False)
-
-
 # ==================== Microphone streaming ====================
 
 @torch.no_grad()
@@ -406,6 +170,11 @@ def stream_mic(args, model, char_dict):
 
     fe = GPUMel80(device, sr) if args.use_gpu_mel else None
 
+    idle_flush_chunks = args.idle_flush_chunks
+    max_tail_chars = args.max_tail_chars
+    punct_flush = args.punct_flush
+    idle_counter = 0  # đếm số chunk không tiến triển
+
     print("Mic streaming. Ctrl+C để dừng.")
     with sd.InputStream(samplerate=sr, channels=1, dtype="float32", blocksize=block) as stream:
         while True:
@@ -413,44 +182,32 @@ def stream_mic(args, model, char_dict):
             a = np.squeeze(audio_block, axis=1).astype(np.float32)
             q.append(a)
 
-            # im lặng để flush
-            silence_run = silence_run + 1 if _rms(a) < args.silence_rms else 0
-
             if len(q) < 1 + look_blocks:
                 continue
 
-            # ghép block + lookahead
-            seg_np = np.concatenate([q[0]] + list(list(q)[1:1+look_blocks]))
+            seg_np = np.concatenate([q[0]] + list(list(q)[1:1 + look_blocks]))
             seg = torch.from_numpy(seg_np).unsqueeze(0).to(device)
             seg = seg * (1 << 15)
             if seg.size(1) < int(0.025 * sr):
                 q.popleft()
                 continue
 
-            if fe is None:
-                x = _kaldi_fbank_cpu(seg).to(device)
-            else:
-                x = fe(seg)
+            x = _kaldi_fbank_cpu(seg).to(device) if fe is None else fe(seg)
             x_len = torch.tensor([x.size(1)], dtype=torch.int, device=device)
 
             with torch.cuda.amp.autocast(dtype=torch.float16):
-                truncated_context_size = chunk_size
                 enc_out, enc_len, _, att_cache, cnn_cache, offset = model.encoder.forward_parallel_chunk(
-                    xs=x,
-                    xs_origin_lens=x_len,
+                    xs=x, xs_origin_lens=x_len,
                     chunk_size=chunk_size,
                     left_context_size=left_context_size,
                     right_context_size=right_context_size,
-                    att_cache=att_cache,
-                    cnn_cache=cnn_cache,
-                    truncated_context_size=truncated_context_size,
-                    offset=offset
+                    att_cache=att_cache, cnn_cache=cnn_cache,
+                    truncated_context_size=chunk_size, offset=offset
                 )
                 enc_out = enc_out.reshape(1, -1, enc_out.size(-1))[:, :enc_len]
-                if enc_out.size(1) > truncated_context_size:
-                    enc_out = enc_out[:, :truncated_context_size]
+                if enc_out.size(1) > chunk_size:
+                    enc_out = enc_out[:, :chunk_size]
                 offset = offset - enc_len + enc_out.size(1)
-
                 hyp_step = model.encoder.ctc_forward(enc_out).squeeze(0).cpu()
 
             seg_start_ms = int(produced_steps * subsampling * 10)
@@ -459,23 +216,43 @@ def stream_mic(args, model, char_dict):
 
             chunk_text = get_output([hyp_step], char_dict)[0]
 
+            # merge
             merged = _smart_merge(carry_text, chunk_text, lcs_window=args.lcs_window, lcs_min=args.lcs_min)
             overlap_used = len(carry_text) + len(chunk_text) - len(merged)
             overlap_ratio = 0.0 if len(chunk_text) == 0 else max(0.0, min(1.0, overlap_used / max(1, len(chunk_text))))
-            reserve_words = _adaptive_reserve_words(overlap_ratio, base=args.stable_reserve_words, hard=args.stable_reserve_words+1, thresh=args.adaptive_overlap_thresh)
-
+            reserve_words = _adaptive_reserve_words(overlap_ratio, base=args.stable_reserve_words,
+                                                    hard=args.stable_reserve_words + 1,
+                                                    thresh=args.adaptive_overlap_thresh)
             commit, new_tail = _split_commit_tail(merged, reserve_last_k_words=reserve_words)
 
-            if commit:
-                print(f"{milliseconds_to_hhmmssms(seg_start_ms)} - {milliseconds_to_hhmmssms(seg_end_ms)}: {commit.strip()}")
+            progressed = bool(commit) or (new_tail != carry_text)  # có thay đổi thực sự?
+            if progressed:
+                idle_counter = 0
+            else:
+                idle_counter += 1
 
-            if silence_run >= args.silence_runs and new_tail.strip():
-                print(f"{milliseconds_to_hhmmssms(seg_start_ms)} - {milliseconds_to_hhmmssms(seg_end_ms)}: {new_tail.strip()}")
+            # in phần commit nếu có
+            if commit:
+                print(
+                    f"{milliseconds_to_hhmmssms(seg_start_ms)} - {milliseconds_to_hhmmssms(seg_end_ms)}: {commit.strip()}")
+
+            # các điều kiện ép commit đuôi
+            do_force = False
+            if punct_flush and re.search(r"[.!?…。，、！？；：]\s*$", new_tail):
+                do_force = True
+            if len(new_tail) >= max_tail_chars:
+                do_force = True
+            if idle_counter >= idle_flush_chunks and new_tail.strip():
+                do_force = True
+
+            if do_force and new_tail.strip():
+                print(
+                    f"{milliseconds_to_hhmmssms(seg_start_ms)} - {milliseconds_to_hhmmssms(seg_end_ms)}: {new_tail.strip()}")
                 new_tail = ""
+                idle_counter = 0
 
             carry_text = new_tail
             q.popleft()
-
 
 # ==================== Main ====================
 
@@ -508,6 +285,10 @@ def main():
     parser.add_argument("--silence_rms", type=float, default=0.005)
     parser.add_argument("--silence_runs", type=int, default=3)
 
+    parser.add_argument("--idle_flush_chunks", type=int, default=5)
+    parser.add_argument("--max_tail_chars", type=int, default=40)
+    parser.add_argument("--punct_flush", action="store_true")
+
     # GPU mel
     parser.add_argument("--use_gpu_mel", action="store_true")
 
@@ -523,29 +304,28 @@ def main():
 
     if getattr(args, "mic", False):
         stream_mic(args, model, char_dict); return
-    if args.stream and args.long_form_audio:
-        stream_audio(args, model, char_dict)
-    elif args.long_form_audio:
-        endless_decode(args, model, char_dict)
-    else:
-        batch_decode(args, model, char_dict)
 
 
 if __name__ == "__main__":
     import sys
     # ví dụ chạy mic
+    import sys
+
     sys.argv = [
         "realtime_decode.py",
         "--model_checkpoint", "/home/trinhchau/code/EduAssist/api/services/chunkformer-large-vie",
         "--mic",
         "--mic_sr", "16000",
-        "--left_context_size", "64",
-        "--right_context_size", "16",
+        "--left_context_size", "16",
+        "--right_context_size", "8",
         "--stream_chunk_sec", "0.5",
-        "--lookahead_sec", "0.25",
-        "--stable_reserve_words", "1",
-        "--lcs_window", "48",
-        "--lcs_min", "12",
-        "--use_gpu_mel"
+        "--lookahead_sec", "0.2",
+        "--stable_reserve_words", "0",
+        "--lcs_window", "64",
+        "--lcs_min", "16",
+        "--use_gpu_mel",
+        "--idle_flush_chunks", "2",  # ép commit nếu 5 chunk (~1s) không tiến triển
+        "--max_tail_chars", "40",  # commit nếu đuôi vượt 40 ký tự
+        "--punct_flush"  # commit khi kết thúc bằng dấu câu
     ]
-    main()
+main()
