@@ -12,3 +12,22 @@ hãy phân tích và tóm tắt lại nội dung có trong cuộc hội thoại 
 PROMPT_QA = """Bạn là một trợ lý AI thân thiện. Bạn sẽ nhận được một bản tóm tắt cuộc họp và câu hỏi của người dùng,
 nhiệm vụ của bạn là hãy dựa vào bản tóm tắt cuộc họp phía trên và trả lời câu hỏi của người dùng chính xác nhất. 
 Tuyệt đối không được bịa ra câu trả lời về cuộc hội thoại!"""
+
+
+
+# Retriever
+SEARCH_KWARGS = {'k': 25, 'score_threshold': 0.01, 'sorted': True}
+SEARCH_TYPE = "similarity_score_threshold"
+
+# Vector database
+SYSTEM_DATABASE = "./vectorstores/db_faiss"
+USER_DATABASE = "./vectorstores/db_faiss_for_user"
+
+SYSTEM_DOCUMENT = "./data/data_system"
+USER_DOCUMENT = "./data/data_user"
+
+# Load data
+CHUNK_SIZE = 1500
+CHUNK_OVERLAP = 200
+
+MODEL_EMBEDDING = "models/gemini-embedding-001"
