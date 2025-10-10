@@ -1,4 +1,4 @@
-import os, math, argparse, yaml, re
+import os, math, argparse, yaml, re, sys
 import torch, torchaudio
 import numpy as np
 from collections import deque
@@ -7,8 +7,7 @@ import torchaudio.compliance.kaldi as kaldi
 from model.utils.init_model import init_model
 from model.utils.checkpoint import load_checkpoint
 from model.utils.file_utils import read_symbol_table
-from model.utils.ctc_utils import get_output, milliseconds_to_hhmmssms
-
+from model.utils.ctc_utils import get_output
 
 # ==================== Text merge & stability ====================
 
@@ -20,7 +19,6 @@ def _longest_suffix_prefix_overlap(a: str, b: str, max_k: int = 64) -> int:
     return 0
 
 def _longest_common_substring(a: str, b: str):
-    """LCSubstr trên cửa sổ nhỏ, trả (len, end_a, end_b). O(mn) với m,n<=64."""
     m, n = len(a), len(b)
     dp = [[0]*(n+1) for _ in range(m+1)]
     best = (0, 0, 0)
@@ -43,8 +41,7 @@ def _split_commit_tail(text: str, reserve_last_k_words: int = 1):
     for p in parts:
         buf += p
         if _WORD_BOUNDARY_RE.fullmatch(p or ""):
-            words.append(buf)
-            buf = ""
+            words.append(buf); buf = ""
     if buf:
         words.append(buf)
     if not words:
@@ -61,17 +58,11 @@ def _smart_merge(prev_tail: str, cur_text: str, lcs_window=48, lcs_min=12):
     b = cur_text[:lcs_window]
     L, _ea, eb = _longest_common_substring(a, b)
     if L >= lcs_min:
-        return prev_tail + cur_text[eb:]  # bỏ phần trùng
+        return prev_tail + cur_text[eb:]  # bỏ trùng
     return prev_tail + cur_text
 
 def _adaptive_reserve_words(overlap_ratio: float, base=1, hard=2, thresh=0.35):
     return hard if overlap_ratio < thresh else base
-
-def _rms(x: np.ndarray) -> float:
-    if x.size == 0:
-        return 0.0
-    return float(np.sqrt(np.mean(x.astype(np.float32) ** 2)))
-
 
 # ==================== Feature extractors ====================
 
@@ -89,10 +80,9 @@ class GPUMel80:
 
     @torch.no_grad()
     def __call__(self, wav_1xT: torch.Tensor) -> torch.Tensor:
-        # wav in 1xT, range like Kaldi (scaled), we just compute log-mel
-        mel = self.mel(wav_1xT.to(self.device))  # (1, 80, Tm)
-        mel = torch.clamp(mel, min=1e-10).log().transpose(1, 2).contiguous()  # (1, Tm, 80)
-        return mel
+        mel = self.mel(wav_1xT.to(self.device))
+        mel = torch.clamp(mel, min=1e-10).log().transpose(1, 2).contiguous()
+        return mel  # (1, Tm, 80)
 
 @torch.no_grad()
 def _kaldi_fbank_cpu(wav_1xT: torch.Tensor) -> torch.Tensor:
@@ -101,7 +91,6 @@ def _kaldi_fbank_cpu(wav_1xT: torch.Tensor) -> torch.Tensor:
         num_mel_bins=80, frame_length=25, frame_shift=10,
         dither=0.0, energy_floor=0.0, sample_frequency=16000
     ).unsqueeze(0)  # (1, T, 80)
-
 
 # ==================== Model init ====================
 
@@ -133,8 +122,23 @@ def init(model_checkpoint):
     char_dict = {v: k for k, v in symbol_table.items()}
     return model, char_dict
 
+# ==================== Single-line writer ====================
 
-# ==================== Microphone streaming ====================
+class _LineWriter:
+    def __init__(self):
+        self.prev_len = 0
+    def write(self, s: str):
+        s = s.replace("\n", " ")
+        sys.stdout.write("\r" + s)
+        # xóa phần thừa nếu ngắn hơn lần trước
+        extra = self.prev_len - len(s)
+        if extra > 0:
+            sys.stdout.write(" " * extra)
+            sys.stdout.write("\r" + s)
+        sys.stdout.flush()
+        self.prev_len = len(s)
+
+# ==================== Microphone streaming (one-line display) ====================
 
 @torch.no_grad()
 def stream_mic(args, model, char_dict):
@@ -164,18 +168,15 @@ def stream_mic(args, model, char_dict):
     look_blocks = max(0, int(math.ceil(args.lookahead_sec / args.stream_chunk_sec)))
 
     q = deque()
-    produced_steps = 0
-    carry_text = ""
-    silence_run = 0
+    full_text = ""     # đã commit
+    carry_text = ""    # đuôi chưa commit
+    last_snapshot = ""
+    idle_counter = 0
 
     fe = GPUMel80(device, sr) if args.use_gpu_mel else None
+    line = _LineWriter()
 
-    idle_flush_chunks = args.idle_flush_chunks
-    max_tail_chars = args.max_tail_chars
-    punct_flush = args.punct_flush
-    idle_counter = 0  # đếm số chunk không tiến triển
-
-    print("Mic streaming. Ctrl+C để dừng.")
+    # không in dòng hướng dẫn để giữ “một hàng”
     with sd.InputStream(samplerate=sr, channels=1, dtype="float32", blocksize=block) as stream:
         while True:
             audio_block, _ = stream.read(block)
@@ -183,19 +184,21 @@ def stream_mic(args, model, char_dict):
             q.append(a)
 
             if len(q) < 1 + look_blocks:
+                # cập nhật hiển thị ngay cả khi chưa đủ lookahead
+                if args.show_tail and (full_text or carry_text):
+                    line.write(full_text + carry_text)
                 continue
 
             seg_np = np.concatenate([q[0]] + list(list(q)[1:1 + look_blocks]))
             seg = torch.from_numpy(seg_np).unsqueeze(0).to(device)
             seg = seg * (1 << 15)
             if seg.size(1) < int(0.025 * sr):
-                q.popleft()
-                continue
+                q.popleft(); continue
 
             x = _kaldi_fbank_cpu(seg).to(device) if fe is None else fe(seg)
             x_len = torch.tensor([x.size(1)], dtype=torch.int, device=device)
 
-            with torch.cuda.amp.autocast(dtype=torch.float16):
+            with torch.amp.autocast("cuda", dtype=torch.float16):
                 enc_out, enc_len, _, att_cache, cnn_cache, offset = model.encoder.forward_parallel_chunk(
                     xs=x, xs_origin_lens=x_len,
                     chunk_size=chunk_size,
@@ -210,55 +213,58 @@ def stream_mic(args, model, char_dict):
                 offset = offset - enc_len + enc_out.size(1)
                 hyp_step = model.encoder.ctc_forward(enc_out).squeeze(0).cpu()
 
-            seg_start_ms = int(produced_steps * subsampling * 10)
-            seg_end_ms = int((produced_steps + hyp_step.numel()) * subsampling * 10)
-            produced_steps += hyp_step.numel()
-
             chunk_text = get_output([hyp_step], char_dict)[0]
 
-            # merge
+            # smart merge
             merged = _smart_merge(carry_text, chunk_text, lcs_window=args.lcs_window, lcs_min=args.lcs_min)
             overlap_used = len(carry_text) + len(chunk_text) - len(merged)
             overlap_ratio = 0.0 if len(chunk_text) == 0 else max(0.0, min(1.0, overlap_used / max(1, len(chunk_text))))
-            reserve_words = _adaptive_reserve_words(overlap_ratio, base=args.stable_reserve_words,
+            reserve_words = _adaptive_reserve_words(overlap_ratio,
+                                                    base=args.stable_reserve_words,
                                                     hard=args.stable_reserve_words + 1,
                                                     thresh=args.adaptive_overlap_thresh)
             commit, new_tail = _split_commit_tail(merged, reserve_last_k_words=reserve_words)
 
-            progressed = bool(commit) or (new_tail != carry_text)  # có thay đổi thực sự?
-            if progressed:
-                idle_counter = 0
-            else:
-                idle_counter += 1
+            progressed = bool(commit) or (new_tail != last_snapshot)
+            idle_counter = 0 if progressed else (idle_counter + 1)
+            last_snapshot = new_tail
 
-            # in phần commit nếu có
+            # cập nhật buffer
             if commit:
-                print(
-                    f"{milliseconds_to_hhmmssms(seg_start_ms)} - {milliseconds_to_hhmmssms(seg_end_ms)}: {commit.strip()}")
+                full_text += commit
 
-            # các điều kiện ép commit đuôi
+            # ép commit đuôi theo các tiêu chí nhanh
             do_force = False
-            if punct_flush and re.search(r"[.!?…。，、！？；：]\s*$", new_tail):
+            if args.punct_flush and re.search(r"[.!?…。，、！？；：]\s*$", new_tail):
                 do_force = True
-            if len(new_tail) >= max_tail_chars:
+            if len(new_tail) >= args.max_tail_chars:
                 do_force = True
-            if idle_counter >= idle_flush_chunks and new_tail.strip():
+            if idle_counter >= args.idle_flush_chunks and new_tail.strip():
                 do_force = True
 
             if do_force and new_tail.strip():
-                print(
-                    f"{milliseconds_to_hhmmssms(seg_start_ms)} - {milliseconds_to_hhmmssms(seg_end_ms)}: {new_tail.strip()}")
+                # giữ khoảng trắng nếu có
+                full_text += new_tail
                 new_tail = ""
                 idle_counter = 0
 
             carry_text = new_tail
+
+            # one-line update
+            if args.show_tail:
+                display = (full_text + carry_text).strip()
+            else:
+                display = full_text.strip()
+            line.write(display)
+
             q.popleft()
 
 # ==================== Main ====================
 
 def main():
-    parser = argparse.ArgumentParser(description="ChunkFormer streaming without CIF (stabilized)")
+    parser = argparse.ArgumentParser(description="ChunkFormer streaming one-line (no timestamps)")
 
+    # giữ nguyên tham số cũ
     parser.add_argument("--model_checkpoint", type=str, required=True)
     parser.add_argument("--max_duration", type=int, default=1800)
     parser.add_argument("--chunk_size", type=int, default=64)
@@ -281,7 +287,7 @@ def main():
     parser.add_argument("--lcs_window", type=int, default=48)
     parser.add_argument("--lcs_min", type=int, default=12)
 
-    # im lặng để flush tail
+    # tham số tương thích (không VAD)
     parser.add_argument("--silence_rms", type=float, default=0.005)
     parser.add_argument("--silence_runs", type=int, default=3)
 
@@ -292,11 +298,13 @@ def main():
     # GPU mel
     parser.add_argument("--use_gpu_mel", action="store_true")
 
+    # cờ mới cho hiển thị
+    parser.add_argument("--show_tail", action="store_true",
+                        help="Hiển thị cả phần đuôi chưa ổn định trên cùng một hàng.")
+
     args = parser.parse_args()
 
-    print(f"Model: {args.model_checkpoint}")
-    print(f"Stream chunk: {args.stream_chunk_sec}s | lookahead: {args.lookahead_sec}s | L/R ctx: {args.left_context_size}/{args.right_context_size}")
-    print(f"GPU Mel: {args.use_gpu_mel}")
+    # không in header để giữ một hàng ngay từ đầu
 
     assert any([getattr(args, "mic", False), args.long_form_audio, args.audio_list]), "Cần --mic hoặc --long_form_audio hoặc --audio_list"
 
@@ -305,12 +313,8 @@ def main():
     if getattr(args, "mic", False):
         stream_mic(args, model, char_dict); return
 
-
 if __name__ == "__main__":
     import sys
-    # ví dụ chạy mic
-    import sys
-
     sys.argv = [
         "realtime_decode.py",
         "--model_checkpoint", "/home/trinhchau/code/EduAssist/api/services/chunkformer-large-vie",
@@ -324,8 +328,9 @@ if __name__ == "__main__":
         "--lcs_window", "64",
         "--lcs_min", "16",
         "--use_gpu_mel",
-        "--idle_flush_chunks", "2",  # ép commit nếu 5 chunk (~1s) không tiến triển
-        "--max_tail_chars", "40",  # commit nếu đuôi vượt 40 ký tự
-        "--punct_flush"  # commit khi kết thúc bằng dấu câu
+        "--idle_flush_chunks", "1 ",
+        "--max_tail_chars", "40",
+        "--punct_flush",
+        # "--show_tail",
     ]
-main()
+    main()
