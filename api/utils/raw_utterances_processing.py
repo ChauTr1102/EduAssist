@@ -109,3 +109,15 @@ def utterances_to_documents(utterances: List[Utterance],
             metadata["conversation_id"] = conversation_id
         docs.append(Document(page_content=u.text, metadata=metadata))
     return docs
+
+def utterances_to_documents_no_speakers(transcript, start, end, idx) -> Document:
+    metadata = {
+        "speaker": "UNKNOWN",
+        "start_seconds": start,
+        "end_seconds": end,
+        "duration_seconds": round(end - start, 3),
+        "turn_id": idx+1,
+        "conversation_id": None
+    }
+
+    return Document(page_content=transcript, metadata=metadata)

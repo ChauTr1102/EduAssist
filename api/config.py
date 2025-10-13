@@ -19,9 +19,7 @@ Tuyệt đối không được bịa ra câu trả lời về cuộc hội tho�
 SEARCH_KWARGS = {'k': 25, 'score_threshold': 0.01, 'sorted': True}
 SEARCH_TYPE = "similarity_score_threshold"
 
-# Vector database
-SYSTEM_DATABASE = "./vectorstores/db_faiss"
-USER_DATABASE = "./vectorstores/db_faiss_for_user"
+VECTOR_DATABASE = "./vectorstores/"
 
 SYSTEM_DOCUMENT = "./data/data_system"
 USER_DOCUMENT = "./data/data_user"
@@ -30,4 +28,4 @@ USER_DOCUMENT = "./data/data_user"
 CHUNK_SIZE = 1500
 CHUNK_OVERLAP = 200
 
-MODEL_EMBEDDING = "models/gemini-embedding-001"
+MODEL_EMBEDDING = "AITeamVN/Vietnamese_Embedding"
