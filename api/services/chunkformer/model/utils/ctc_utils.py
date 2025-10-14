@@ -38,6 +38,12 @@ def get_output(hyps, char_dict):
     return decodes
 
 
+def get_output_1(hyp, char_dict):
+    hyp = remove_duplicates_and_blank(hyp)
+    decode = class2str(hyp, char_dict)
+    return decode
+
+
 def get_output_with_timestamps(hyps, char_dict):
     decodes = []
     max_silence = 7
