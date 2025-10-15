@@ -18,7 +18,7 @@ from model.utils.init_model import init_model
 from model.utils.checkpoint import load_checkpoint
 from model.utils.file_utils import read_symbol_table
 from model.utils.ctc_utils import get_output_with_timestamps, get_output, milliseconds_to_hhmmssms
-
+from api.private_config import *
 
 # ==================== Utils for stable streaming without CIF ====================
 
@@ -571,7 +571,7 @@ if __name__ == "__main__":
     # ví dụ chạy mic
     sys.argv = [
         "realtime_decode.py",
-        "--model_checkpoint", "/home/bojjoo/Code/EduAssist/api/services/chunkformer-large-vie",
+        "--model_checkpoint", CHUNKFORMER_CHECKPOINT,
         "--mic",
         "--mic_sr", "16000",
         "--left_context_size", "128",
