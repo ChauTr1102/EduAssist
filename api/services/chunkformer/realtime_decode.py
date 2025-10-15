@@ -315,9 +315,6 @@ def main():
     parser.add_argument("--lcs_window", type=int, default=48)
     parser.add_argument("--lcs_min", type=int, default=12)
 
-    # tham số tương thích (không VAD)
-    parser.add_argument("--silence_rms", type=float, default=0.005)
-    parser.add_argument("--silence_runs", type=int, default=3)
 
     parser.add_argument("--idle_flush_chunks", type=int, default=5)
     parser.add_argument("--max_tail_chars", type=int, default=40)
@@ -340,7 +337,6 @@ def main():
 
     if getattr(args, "mic", False):
         stream_mic(args, model, char_dict); return
-
 if __name__ == "__main__":
     import sys
     sys.argv = [
@@ -351,14 +347,15 @@ if __name__ == "__main__":
         "--left_context_size", "16",
         "--right_context_size", "8",
         "--stream_chunk_sec", "0.5",
-        "--lookahead_sec", "0.2",
+        "--lookahead_sec", "0.2 ",
         "--stable_reserve_words", "0",
         "--lcs_window", "64",
         "--lcs_min", "16",
         "--use_gpu_mel",
-        "--idle_flush_chunks", "1 ",
+        "--idle_flush_chunks", "1",
         "--max_tail_chars", "40",
         "--punct_flush",
         # "--show_tail",
     ]
     main()
+
