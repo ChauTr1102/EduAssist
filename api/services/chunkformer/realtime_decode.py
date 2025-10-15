@@ -178,6 +178,15 @@ def stream_mic(args, model, char_dict):
 
     # không in dòng hướng dẫn để giữ “một hàng”
     with sd.InputStream(samplerate=sr, channels=1, dtype="float32", blocksize=block) as stream:
+    produced_steps = 0
+    carry_text = ""
+    silence_run = 0
+    SIL_THRESH = args.silence_rms
+    SIL_RUN_TO_FLUSH = args.silence_runs
+
+    print("Mic streaming. Ctrl+C để dừng.")
+    with sd.InputStream(samplerate=sr, channels=1, dtype="float32", blocksize=block_samples) as stream:
+        prev_end_time = 0
         while True:
             audio_block, _ = stream.read(block)
             a = np.squeeze(audio_block, axis=1).astype(np.float32)
@@ -245,6 +254,25 @@ def stream_mic(args, model, char_dict):
             if do_force and new_tail.strip():
                 # giữ khoảng trắng nếu có
                 full_text += new_tail
+                # print(f"{milliseconds_to_hhmmssms(seg_start_ms)} - {milliseconds_to_hhmmssms(seg_end_ms)}: {commit.strip()}")
+                if commit.strip() and commit.strip() != " ":
+                    if seg_start_ms - prev_end_time <= 500:
+                        print(f"{commit.strip()}",
+                              end=" ")  # {milliseconds_to_hhmmssms(seg_start_ms)} - {milliseconds_to_hhmmssms(seg_end_ms)}:
+                    else:
+                        print(f"{commit.strip()}", ".", "\n", end="")
+                    prev_end_time = seg_end_ms
+
+            # Nếu im lặng nhiều block thì flush tail
+            if silence_run >= SIL_RUN_TO_FLUSH and new_tail.strip():
+                # print(f"{milliseconds_to_hhmmssms(seg_start_ms)} - {milliseconds_to_hhmmssms(seg_end_ms)}: {new_tail.strip()}")
+                if new_tail.strip() and new_tail.strip() != " ":
+                    if seg_start_ms - prev_end_time <= 500:
+                        print(f"{new_tail.strip()}",
+                              end=" ")  # {milliseconds_to_hhmmssms(seg_start_ms)} - {milliseconds_to_hhmmssms(seg_end_ms)}:
+                    else:
+                        print(".", "\n", f"{new_tail.strip()}", end="")
+                    prev_end_time = seg_end_ms
                 new_tail = ""
                 idle_counter = 0
 
@@ -317,7 +345,7 @@ if __name__ == "__main__":
     import sys
     sys.argv = [
         "realtime_decode.py",
-        "--model_checkpoint", "/home/trinhchau/code/EduAssist/api/services/chunkformer-large-vie",
+        "--model_checkpoint", "/home/bojjoo/Code/EduAssist/api/services/chunkformer-large-vie",
         "--mic",
         "--mic_sr", "16000",
         "--left_context_size", "16",

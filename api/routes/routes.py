@@ -14,7 +14,7 @@ router = APIRouter()
 
 faster_whisper = FasterWhisper("large-v3")
 model_llm = LLM(os.getenv("API_KEY"))
-chunkformer_stt = Chunkformer()
+chunkformer_stt = ChunkFormer("api/services/chunkformer-large-vie")
 
 @router.get("/", response_model=APIInfo)
 async def home():

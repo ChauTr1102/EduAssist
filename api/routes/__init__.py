@@ -4,7 +4,7 @@ from pydantic import BaseModel, EmailStr, validator, Field
 from dotenv import load_dotenv
 import tempfile
 from api.services.whisper import FasterWhisper
-from api.services.chunkformer_stt import Chunkformer
+from api.services.chunkformer_stt import ChunkFormer
 from api.services.llm import LLM
 import logging
 import time
