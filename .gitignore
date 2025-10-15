@@ -216,4 +216,5 @@ audio_output
 
 api/services/chunkformer-large-vie
 api/services/hehe.py
+api/private_config.py
 
