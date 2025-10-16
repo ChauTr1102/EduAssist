@@ -1,4 +1,4 @@
-import os, math, argparse, yaml, re, sys
+import os, math, argparse, yaml, re, sys, threading, queue
 import torch, torchaudio
 import numpy as np
 from collections import deque
@@ -16,7 +16,6 @@ from model.utils.init_model import init_model
 from model.utils.checkpoint import load_checkpoint
 from model.utils.file_utils import read_symbol_table
 from model.utils.ctc_utils import get_output
-
 from api.private_config import *
 
 # ==================== ANSI ====================
@@ -89,7 +88,7 @@ def _split_prefix_last_k_words(text: str, k: int):
     if len(words) <= k: return "", "".join(words)
     return "".join(words[:-k]), "".join(words[-k:])
 
-def _count_tokens(s: str) -> int:
+def _count_words(s: str) -> int:
     s = s.strip()
     return 0 if not s else len([t for t in re.split(r"\s+", s) if t])
 
@@ -118,34 +117,67 @@ def _kaldi_fbank_cpu(wav_1xT: torch.Tensor) -> torch.Tensor:
         dither=0.0, energy_floor=0.0, sample_frequency=16000
     ).unsqueeze(0)
 
-# ==================== Punctuator (idle + lookahead confirm) ====================
+# ==================== Punctuator worker (async, lookahead confirm) ====================
 
 _EOS_RE = re.compile(r"[.!?…。，、！？；：]\s*$")
 
-class _PunctSync:
+class _PunctWorker:
+    """Non-blocking ONNX punctuator. Last-write-wins."""
     def __init__(self, enabled: bool, model_name: str, providers: str, min_chars: int):
         self.enabled = enabled and (PunctCapSegModelONNX is not None)
         self.min_chars = min_chars
+        self._q = queue.Queue(maxsize=1)
+        self._res_q = queue.Queue(maxsize=1)
+        self._alive = False
         self._model = None
+        self._prov = providers
         if not self.enabled: return
-        try:
-            self._model = PunctCapSegModelONNX.from_pretrained(model_name)
-            prov = ["CPUExecutionProvider"] if providers == "cpu" else ["CUDAExecutionProvider","CPUExecutionProvider"]
-            for name in dir(self._model):
-                obj = getattr(self._model, name)
-                if ort is not None and isinstance(obj, ort.InferenceSession):
-                    obj.set_providers(prov)
-        except Exception:
-            self.enabled = False
 
-    def punct(self, seg: str) -> str:
-        if not self.enabled: return seg
-        s = seg.strip()
-        if len(s) < self.min_chars: return seg
-        try:
-            return self._model.infer([seg], apply_sbd=False)[0]
-        except Exception:
-            return seg
+        def _boot():
+            try:
+                self._model = PunctCapSegModelONNX.from_pretrained(model_name)
+                prov = ["CPUExecutionProvider"] if self._prov == "cpu" else ["CUDAExecutionProvider","CPUExecutionProvider"]
+                for name in dir(self._model):
+                    obj = getattr(self._model, name)
+                    if ort is not None and isinstance(obj, ort.InferenceSession):
+                        obj.set_providers(prov)
+            except Exception:
+                self.enabled = False
+                return
+            self._alive = True
+            while self._alive:
+                try:
+                    job = self._q.get(timeout=0.1)
+                except queue.Empty:
+                    continue
+                job_id, prefix, lastk = job
+                seg = lastk
+                try:
+                    fixed = seg if len(seg.strip()) < self.min_chars else self._model.infer([seg], apply_sbd=False)[0]
+                except Exception:
+                    fixed = seg
+                # drop stale result if queue already has newer
+                if not self._res_q.empty():
+                    try: self._res_q.get_nowait()
+                    except queue.Empty: pass
+                self._res_q.put((job_id, prefix, lastk, fixed))
+
+        self._th = threading.Thread(target=_boot, daemon=True)
+        self._th.start()
+
+    def stop(self): self._alive = False
+
+    def submit(self, job_id: int, prefix: str, lastk: str):
+        if not self.enabled: return
+        if not self._q.empty():
+            try: self._q.get_nowait()
+            except queue.Empty: pass
+        self._q.put((job_id, prefix, lastk))
+
+    def poll(self):
+        if not self.enabled: return None
+        try: return self._res_q.get_nowait()
+        except queue.Empty: return None
 
 # ==================== Model init ====================
 
@@ -175,8 +207,7 @@ def init(model_checkpoint):
 # ==================== One-line writer ====================
 
 class _LineWriter:
-    def __init__(self):
-        self.prev_len = 0
+    def __init__(self): self.prev_len = 0
     def write(self, s: str):
         s = s.replace("\n", " ")
         sys.stdout.write("\r" + s)
@@ -226,15 +257,15 @@ def stream_mic(args, model, char_dict):
     blink = False
     ansi_ok = _supports_ansi()
 
-    punct = _PunctSync(
+    # async punctuator
+    punct = _PunctWorker(
         enabled=args.punct,
         model_name=args.punct_model,
         providers=args.punct_prov,
         min_chars=args.punct_min_chars
     )
-
-    # pending punctuation confirmation state
-    pending = None  # dict(prefix,lastk,fixed,base_len,chunks_waited,words_after)
+    job_seq = 0
+    pending = None  # {'job_id', 'prefix','lastk','fixed','model_ready', 'base_len', 'chunks_waited','words_after','added_eos'}
 
     with sd.InputStream(samplerate=sr, channels=1, dtype="float32", blocksize=block) as stream:
         while True:
@@ -242,126 +273,136 @@ def stream_mic(args, model, char_dict):
             a = np.squeeze(audio_block, axis=1).astype(np.float32)
             q.append(a)
 
-            if len(q) < 1 + look_blocks:
-                if args.show_tail and (full_text or carry_text):
-                    tail_disp = carry_text
-                    if ansi_ok and args.twinkle_tail and carry_text:
-                        deco = (ANSI_BLINK if blink else ANSI_REV) + ANSI_DIM
-                        tail_disp = f"{deco}{carry_text}{ANSI_RESET}"
-                    line.write((full_text + tail_disp).strip())
-                    blink = not blink
-                continue
+            # always render ASAP for ASR realtime feel
+            render_now = True
 
-            seg_np = np.concatenate([q[0]] + list(list(q)[1:1 + look_blocks]))
-            seg = torch.from_numpy(seg_np).unsqueeze(0).to(device) * (1 << 15)
-            if seg.size(1) < int(0.025 * sr):
-                q.popleft(); continue
+            if len(q) >= 1 + look_blocks:
+                seg_np = np.concatenate([q[0]] + list(list(q)[1:1 + look_blocks]))
+                seg = torch.from_numpy(seg_np).unsqueeze(0).to(device) * (1 << 15)
+                if seg.size(1) >= int(0.025 * sr):
+                    x = _kaldi_fbank_cpu(seg).to(device) if fe is None else fe(seg)
+                    x_len = torch.tensor([x.size(1)], dtype=torch.int, device=device)
+                    with torch.amp.autocast("cuda", dtype=torch.float16):
+                        enc_out, enc_len, _, att_cache, cnn_cache, offset = model.encoder.forward_parallel_chunk(
+                            xs=x, xs_origin_lens=x_len, chunk_size=chunk_size,
+                            left_context_size=left_context_size, right_context_size=right_context_size,
+                            att_cache=att_cache, cnn_cache=cnn_cache,
+                            truncated_context_size=chunk_size, offset=offset
+                        )
+                        enc_out = enc_out.reshape(1, -1, enc_out.size(-1))[:, :enc_len]
+                        if enc_out.size(1) > chunk_size: enc_out = enc_out[:, :chunk_size]
+                        offset = offset - enc_len + enc_out.size(1)
+                        hyp_step = model.encoder.ctc_forward(enc_out).squeeze(0).cpu()
 
-            x = _kaldi_fbank_cpu(seg).to(device) if fe is None else fe(seg)
-            x_len = torch.tensor([x.size(1)], dtype=torch.int, device=device)
+                    chunk_text = get_output([hyp_step], char_dict)[0]
 
-            with torch.amp.autocast("cuda", dtype=torch.float16):
-                enc_out, enc_len, _, att_cache, cnn_cache, offset = model.encoder.forward_parallel_chunk(
-                    xs=x, xs_origin_lens=x_len,
-                    chunk_size=chunk_size,
-                    left_context_size=left_context_size,
-                    right_context_size=right_context_size,
-                    att_cache=att_cache, cnn_cache=cnn_cache,
-                    truncated_context_size=chunk_size, offset=offset
-                )
-                enc_out = enc_out.reshape(1, -1, enc_out.size(-1))[:, :enc_len]
-                if enc_out.size(1) > chunk_size:
-                    enc_out = enc_out[:, :chunk_size]
-                offset = offset - enc_len + enc_out.size(1)
-                hyp_step = model.encoder.ctc_forward(enc_out).squeeze(0).cpu()
+                    merged = _smart_merge(carry_text, chunk_text, lcs_window=args.lcs_window, lcs_min=args.lcs_min)
+                    overlap_used = len(carry_text) + len(chunk_text) - len(merged)
+                    overlap_ratio = 0.0 if len(chunk_text) == 0 else max(0.0, min(1.0, overlap_used / max(1, len(chunk_text))))
+                    reserve_words = _adaptive_reserve_words(overlap_ratio,
+                                                            base=args.stable_reserve_words,
+                                                            hard=args.stable_reserve_words + 1,
+                                                            thresh=args.adaptive_overlap_thresh)
+                    commit, new_tail = _split_commit_tail(merged, reserve_last_k_words=reserve_words)
 
-            chunk_text = get_output([hyp_step], char_dict)[0]
+                    progressed = bool(commit) or (new_tail != last_snapshot)
+                    idle_counter = 0 if progressed else (idle_counter + 1)
+                    last_snapshot = new_tail
 
-            merged = _smart_merge(carry_text, chunk_text, lcs_window=args.lcs_window, lcs_min=args.lcs_min)
-            overlap_used = len(carry_text) + len(chunk_text) - len(merged)
-            overlap_ratio = 0.0 if len(chunk_text) == 0 else max(0.0, min(1.0, overlap_used / max(1, len(chunk_text))))
-            reserve_words = _adaptive_reserve_words(overlap_ratio,
-                                                    base=args.stable_reserve_words,
-                                                    hard=args.stable_reserve_words + 1,
-                                                    thresh=args.adaptive_overlap_thresh)
-            commit, new_tail = _split_commit_tail(merged, reserve_last_k_words=reserve_words)
+                    if commit:
+                        full_text += commit
 
-            progressed = bool(commit) or (new_tail != last_snapshot)
-            idle_counter = 0 if progressed else (idle_counter + 1)
-            last_snapshot = new_tail
+                    punct_char_hit = bool(_EOS_RE.search(new_tail))
+                    max_tail_hit = len(new_tail) >= args.max_tail_chars
+                    idle_hit = (idle_counter >= args.idle_flush_chunks) and new_tail.strip()
 
-            if commit:
-                full_text += commit
+                    commit_tail_now = punct_char_hit or max_tail_hit or idle_hit
 
-            punct_char_hit = bool(_EOS_RE.search(new_tail))
-            max_tail_hit = len(new_tail) >= args.max_tail_chars
-            idle_hit = (idle_counter >= args.idle_flush_chunks) and new_tail.strip()
-
-            commit_tail_now = punct_char_hit or max_tail_hit or idle_hit
-
-            if commit_tail_now and new_tail.strip():
-                full_text += new_tail
-                carry_text = ""
-                last_snapshot = ""
-                # run punct only when idle pause detected
-                if args.punct and idle_hit:
-                    prefix, lastk = _split_prefix_last_k_words(full_text, args.punct_window_words)
-                    fixed = punct.punct(lastk)
-                    added_eos = (not _EOS_RE.search(lastk)) and bool(_EOS_RE.search(fixed))
-                    if args.punct_lookahead_words > 0 and added_eos:
-                        pending = {
-                            "prefix": prefix,
-                            "lastk": lastk,
-                            "fixed": fixed,
-                            "base_len": len(prefix) + len(lastk),
-                            "chunks_waited": 0,
-                            "words_after": 0
-                        }
+                    if commit_tail_now and new_tail.strip():
+                        full_text += new_tail
+                        carry_text = ""
+                        last_snapshot = ""
+                        # submit punctuation only on idle
+                        if args.punct and idle_hit and punct.enabled:
+                            prefix, lastk = _split_prefix_last_k_words(full_text, args.punct_window_words)
+                            job_seq += 1
+                            pending = {
+                                "job_id": job_seq, "prefix": prefix, "lastk": lastk,
+                                "fixed": None, "model_ready": False,
+                                "base_len": len(prefix) + len(lastk),
+                                "chunks_waited": 0, "words_after": 0,
+                                "added_eos": False
+                            }
+                            punct.submit(job_seq, prefix, lastk)
+                        idle_counter = 0
                     else:
-                        full_text = prefix + fixed
-                idle_counter = 0
-            else:
-                carry_text = new_tail
+                        carry_text = new_tail
 
-            # confirm pending punctuation with lookahead
+                q.popleft()
+
+            # poll async punctuator (non-blocking)
+            res = punct.poll()
+            if res is not None:
+                job_id, prefix, lastk, fixed = res
+                # ignore stale if no pending or job mismatch
+                if pending is not None and job_id == pending["job_id"] and prefix == pending["prefix"] and lastk == pending["lastk"]:
+                    pending["fixed"] = fixed
+                    pending["model_ready"] = True
+                    pending["added_eos"] = (not _EOS_RE.search(lastk)) and bool(_EOS_RE.search(fixed))
+                    # if only truecase/comma without EOS, overlay immediately
+                    if not pending["added_eos"]:
+                        anchor = pending["prefix"] + pending["lastk"]
+                        if full_text.startswith(anchor):
+                            full_text = pending["prefix"] + fixed + full_text[len(anchor):]
+                        else:
+                            idx = full_text.rfind(pending["lastk"])
+                            if idx != -1:
+                                full_text = full_text[:idx] + fixed + full_text[idx+len(pending["lastk"]):]
+                            else:
+                                full_text = pending["prefix"] + fixed
+                        pending = None
+
+            # confirm pending with lookahead while printing continues
             if pending is not None:
                 pending["chunks_waited"] += 1
-                all_text = (full_text + carry_text)
+                all_text = full_text + carry_text
                 extra = all_text[pending["base_len"]:]
-                pending["words_after"] = _count_tokens(extra)
-                force_by_chunks = pending["chunks_waited"] >= args.punct_lookahead_max_chunks
+                pending["words_after"] = _count_words(extra)
+                # soft triggers
                 force_by_words  = pending["words_after"] >= args.punct_lookahead_words
-                force_by_idle   = idle_hit  # a new idle confirms sentence end
-                if force_by_words or force_by_chunks or force_by_idle:
+                force_by_chunks = pending["chunks_waited"] >= args.punct_lookahead_max_chunks
+                # hard trigger: another idle detected (safe end)
+                another_idle = (idle_counter >= args.idle_flush_chunks) and carry_text.strip()
+                if pending["model_ready"] and (force_by_words or force_by_chunks or another_idle):
                     anchor = pending["prefix"] + pending["lastk"]
+                    fixed = pending["fixed"]
                     if full_text.startswith(anchor):
-                        full_text = pending["prefix"] + pending["fixed"] + full_text[len(anchor):]
+                        full_text = pending["prefix"] + fixed + full_text[len(anchor):]
                     else:
                         idx = full_text.rfind(pending["lastk"])
                         if idx != -1:
-                            full_text = full_text[:idx] + pending["fixed"] + full_text[idx+len(pending["lastk"]):]
+                            full_text = full_text[:idx] + fixed + full_text[idx+len(pending["lastk"]):]
                         else:
-                            full_text = pending["prefix"] + pending["fixed"]
+                            full_text = pending["prefix"] + fixed
                     pending = None
 
-            # render
-            if args.show_tail:
-                if _supports_ansi() and args.twinkle_tail and carry_text:
-                    deco = (ANSI_BLINK if blink else ANSI_REV) + ANSI_DIM
-                    display = (full_text + f"{deco}{carry_text}{ANSI_RESET}").strip()
+            # render ASAP, never blocked by punctuation
+            if True:
+                if args.show_tail:
+                    if ansi_ok and args.twinkle_tail and carry_text:
+                        deco = (ANSI_BLINK if blink else ANSI_REV) + ANSI_DIM
+                        disp = (full_text + f"{deco}{carry_text}{ANSI_RESET}").strip()
+                    else:
+                        disp = (full_text + carry_text).strip()
                 else:
-                    display = (full_text + carry_text).strip()
-            else:
-                display = full_text.strip()
-            _LineWriter().write(display)
-            blink = not blink
-
-            q.popleft()
+                    disp = full_text.strip()
+                line.write(disp)
+                blink = not blink
 
 # ==================== Main ====================
 
 def main():
-    parser = argparse.ArgumentParser(description="ChunkFormer streaming with idle-triggered punctuation and lookahead confirmation")
+    parser = argparse.ArgumentParser(description="ChunkFormer streaming: realtime ASR print, async punctuation with lookahead overlay")
 
     parser.add_argument("--model_checkpoint", type=str, required=True)
     parser.add_argument("--max_duration", type=int, default=1800)
@@ -395,25 +436,23 @@ def main():
     parser.add_argument("--show_tail", action="store_true")
     parser.add_argument("--twinkle_tail", action="store_true")
 
-    # punctuator options
+    # punctuator options (async)
     parser.add_argument("--punct", action="store_true")
     parser.add_argument("--punct_model", type=str, default="1-800-BAD-CODE/xlm-roberta_punctuation_fullstop_truecase")
     parser.add_argument("--punct_prov", type=str, choices=["cpu","cuda"], default="cpu")
     parser.add_argument("--punct_window_words", type=int, default=60)
     parser.add_argument("--punct_min_chars", type=int, default=40)
 
-    # lookahead confirmation
+    # lookahead confirmation for EOS
     parser.add_argument("--punct_lookahead_words", type=int, default=3,
                         help="Số từ mới cần thấy sau điểm chấm câu dự kiến để xác nhận.")
     parser.add_argument("--punct_lookahead_max_chunks", type=int, default=6,
-                        help="Số vòng xử lý tối đa để tự xác nhận nếu người nói vẫn ngắt quãng.")
+                        help="Số vòng xử lý tối đa để xác nhận nếu người nói ngắt quãng dài.")
 
     args = parser.parse_args()
-
     assert any([getattr(args, "mic", False), args.long_form_audio, args.audio_list]), "Cần --mic hoặc --long_form_audio hoặc --audio_list"
 
     model, char_dict = init(args.model_checkpoint)
-
     if getattr(args, "mic", False):
         stream_mic(args, model, char_dict); return
 
@@ -427,7 +466,7 @@ if __name__ == "__main__":
         "--right_context_size", "8",
         "--stream_chunk_sec", "0.5",
         "--lookahead_sec", "0.2",
-        "--stable_reserve_words", "1",
+        "--stable_reserve_words", "0",
         "--lcs_window", "64",
         "--lcs_min", "16",
         "--use_gpu_mel",
@@ -436,7 +475,7 @@ if __name__ == "__main__":
         "--punct",
         "--punct_prov", "cpu",
         "--punct_lookahead_words", "3",
-        "--punct_lookahead_max_chunks", "10",
+        "--punct_lookahead_max_chunks", "6",
         # "--show_tail",
         "--twinkle_tail",
     ]
