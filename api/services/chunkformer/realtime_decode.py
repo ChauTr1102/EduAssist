@@ -1,4 +1,4 @@
-import os, math, argparse, yaml, re, sys, threading, queue, time
+import os, math, argparse, yaml, re, sys
 import torch, torchaudio
 import numpy as np
 from collections import deque
@@ -15,7 +15,8 @@ except Exception:
 from model.utils.init_model import init_model
 from model.utils.checkpoint import load_checkpoint
 from model.utils.file_utils import read_symbol_table
-from model.utils.ctc_utils import get_output_with_timestamps, get_output, milliseconds_to_hhmmssms
+from model.utils.ctc_utils import get_output
+
 from api.private_config import *
 
 # ==================== ANSI ====================
@@ -48,55 +49,49 @@ def _longest_common_substring(a: str, b: str):
                 dp[i][j] = v
                 if v > best[0]:
                     best = (v, i, j)
-    return best  # length, end_a_idx, end_b_idx
+    return best
 
 _WORD_BOUNDARY_RE = re.compile(r"[ \t\n\r\f\v.,!?;:…，。！？；：]")
 
 def _split_commit_tail(text: str, reserve_last_k_words: int = 1):
     parts = re.split(r"(\s+|[.,!?;:…])", text)
-    words = []
-    buf = ""
+    words, buf = [], ""
     for p in parts:
         buf += p
         if _WORD_BOUNDARY_RE.fullmatch(p or ""):
             words.append(buf); buf = ""
-    if buf:
-        words.append(buf)
-    if not words:
-        return "", text
+    if buf: words.append(buf)
+    if not words: return "", text
     if len(words) <= reserve_last_k_words:
         return "", "".join(words)
     return "".join(words[:-reserve_last_k_words]), "".join(words[-reserve_last_k_words:])
 
 def _smart_merge(prev_tail: str, cur_text: str, lcs_window=48, lcs_min=12):
     ov = _longest_suffix_prefix_overlap(prev_tail, cur_text, max_k=lcs_window)
-    if ov >= lcs_min:
-        return prev_tail + cur_text[ov:]
-    a = prev_tail[-lcs_window:]
-    b = cur_text[:lcs_window]
+    if ov >= lcs_min: return prev_tail + cur_text[ov:]
+    a = prev_tail[-lcs_window:]; b = cur_text[:lcs_window]
     L, _ea, eb = _longest_common_substring(a, b)
-    if L >= lcs_min:
-        return prev_tail + cur_text[eb:]
+    if L >= lcs_min: return prev_tail + cur_text[eb:]
     return prev_tail + cur_text
 
 def _adaptive_reserve_words(overlap_ratio: float, base=1, hard=2, thresh=0.35):
     return hard if overlap_ratio < thresh else base
 
 def _split_prefix_last_k_words(text: str, k: int):
-    if k <= 0:
-        return text, ""
+    if k <= 0: return text, ""
     parts = re.split(r"(\s+|[.,!?;:…])", text)
-    words = []
-    buf = ""
+    words, buf = [], ""
     for p in parts:
         buf += p
         if _WORD_BOUNDARY_RE.fullmatch(p or ""):
             words.append(buf); buf = ""
-    if buf:
-        words.append(buf)
-    if len(words) <= k:
-        return "", "".join(words)
+    if buf: words.append(buf)
+    if len(words) <= k: return "", "".join(words)
     return "".join(words[:-k]), "".join(words[-k:])
+
+def _count_tokens(s: str) -> int:
+    s = s.strip()
+    return 0 if not s else len([t for t in re.split(r"\s+", s) if t])
 
 # ==================== Feature extractors ====================
 
@@ -105,10 +100,8 @@ class GPUMel80:
         self.device = device
         self.sr = sr
         self.mel = torchaudio.transforms.MelSpectrogram(
-            sample_rate=sr,
-            n_fft=400, win_length=400, hop_length=160,
-            f_min=0.0, f_max=8000.0,
-            n_mels=80, power=2.0,
+            sample_rate=sr, n_fft=400, win_length=400, hop_length=160,
+            f_min=0.0, f_max=8000.0, n_mels=80, power=2.0,
             mel_scale="htk", norm=None, center=True,
         ).to(device)
 
@@ -116,29 +109,28 @@ class GPUMel80:
     def __call__(self, wav_1xT: torch.Tensor) -> torch.Tensor:
         mel = self.mel(wav_1xT.to(self.device))
         mel = torch.clamp(mel, min=1e-10).log().transpose(1, 2).contiguous()
-        return mel  # (1, Tm, 80)
+        return mel
 
 @torch.no_grad()
 def _kaldi_fbank_cpu(wav_1xT: torch.Tensor) -> torch.Tensor:
     return kaldi.fbank(
-        wav_1xT.cpu(),
-        num_mel_bins=80, frame_length=25, frame_shift=10,
+        wav_1xT.cpu(), num_mel_bins=80, frame_length=25, frame_shift=10,
         dither=0.0, energy_floor=0.0, sample_frequency=16000
     ).unsqueeze(0)
 
-# ==================== Punctuator (synchronous on idle) ====================
+# ==================== Punctuator (idle + lookahead confirm) ====================
+
+_EOS_RE = re.compile(r"[.!?…。，、！？；：]\s*$")
 
 class _PunctSync:
     def __init__(self, enabled: bool, model_name: str, providers: str, min_chars: int):
         self.enabled = enabled and (PunctCapSegModelONNX is not None)
         self.min_chars = min_chars
         self._model = None
-        self._prov = providers
-        if not self.enabled:
-            return
+        if not self.enabled: return
         try:
             self._model = PunctCapSegModelONNX.from_pretrained(model_name)
-            prov = ["CPUExecutionProvider"] if self._prov == "cpu" else ["CUDAExecutionProvider", "CPUExecutionProvider"]
+            prov = ["CPUExecutionProvider"] if providers == "cpu" else ["CUDAExecutionProvider","CPUExecutionProvider"]
             for name in dir(self._model):
                 obj = getattr(self._model, name)
                 if ort is not None and isinstance(obj, ort.InferenceSession):
@@ -147,11 +139,9 @@ class _PunctSync:
             self.enabled = False
 
     def punct(self, seg: str) -> str:
-        if not self.enabled:
-            return seg
+        if not self.enabled: return seg
         s = seg.strip()
-        if len(s) < self.min_chars:
-            return seg
+        if len(s) < self.min_chars: return seg
         try:
             return self._model.infer([seg], apply_sbd=False)[0]
         except Exception:
@@ -169,25 +159,20 @@ def init(model_checkpoint):
         torch.backends.cuda.enable_mem_efficient_sdp(False)
     except Exception:
         pass
-
     cfg = os.path.join(model_checkpoint, "config.yaml")
     ckpt = os.path.join(model_checkpoint, "pytorch_model.bin")
     vocab = os.path.join(model_checkpoint, "vocab.txt")
-
     with open(cfg, 'r') as fin:
         config = yaml.load(fin, Loader=yaml.FullLoader)
-    model = init_model(config, cfg)
-    model.eval()
+    model = init_model(config, cfg); model.eval()
     load_checkpoint(model, ckpt)
-
     model.encoder = model.encoder.cuda()
     model.ctc = model.ctc.cuda()
-
     symbol_table = read_symbol_table(vocab)
     char_dict = {v: k for k, v in symbol_table.items()}
     return model, char_dict
 
-# ==================== Single-line writer ====================
+# ==================== One-line writer ====================
 
 class _LineWriter:
     def __init__(self):
@@ -202,7 +187,7 @@ class _LineWriter:
         sys.stdout.flush()
         self.prev_len = len(s)
 
-# ==================== Microphone streaming ====================
+# ==================== Mic streaming ====================
 
 @torch.no_grad()
 def stream_mic(args, model, char_dict):
@@ -232,8 +217,7 @@ def stream_mic(args, model, char_dict):
     look_blocks = max(0, int(math.ceil(args.lookahead_sec / args.stream_chunk_sec)))
 
     q = deque()
-    full_text = ""
-    carry_text = ""
+    full_text, carry_text = "", ""
     last_snapshot = ""
     idle_counter = 0
 
@@ -248,6 +232,9 @@ def stream_mic(args, model, char_dict):
         providers=args.punct_prov,
         min_chars=args.punct_min_chars
     )
+
+    # pending punctuation confirmation state
+    pending = None  # dict(prefix,lastk,fixed,base_len,chunks_waited,words_after)
 
     with sd.InputStream(samplerate=sr, channels=1, dtype="float32", blocksize=block) as stream:
         while True:
@@ -266,8 +253,7 @@ def stream_mic(args, model, char_dict):
                 continue
 
             seg_np = np.concatenate([q[0]] + list(list(q)[1:1 + look_blocks]))
-            seg = torch.from_numpy(seg_np).unsqueeze(0).to(device)
-            seg = seg * (1 << 15)
+            seg = torch.from_numpy(seg_np).unsqueeze(0).to(device) * (1 << 15)
             if seg.size(1) < int(0.025 * sr):
                 q.popleft(); continue
 
@@ -307,8 +293,7 @@ def stream_mic(args, model, char_dict):
             if commit:
                 full_text += commit
 
-            # commit tail when needed, but only punctuate on idle
-            punct_char_hit = bool(re.search(r"[.!?…。，、！？；：]\s*$", new_tail))
+            punct_char_hit = bool(_EOS_RE.search(new_tail))
             max_tail_hit = len(new_tail) >= args.max_tail_chars
             idle_hit = (idle_counter >= args.idle_flush_chunks) and new_tail.strip()
 
@@ -318,24 +303,57 @@ def stream_mic(args, model, char_dict):
                 full_text += new_tail
                 carry_text = ""
                 last_snapshot = ""
-                # punctuation only when idle pause detected
+                # run punct only when idle pause detected
                 if args.punct and idle_hit:
                     prefix, lastk = _split_prefix_last_k_words(full_text, args.punct_window_words)
                     fixed = punct.punct(lastk)
-                    full_text = prefix + fixed
+                    added_eos = (not _EOS_RE.search(lastk)) and bool(_EOS_RE.search(fixed))
+                    if args.punct_lookahead_words > 0 and added_eos:
+                        pending = {
+                            "prefix": prefix,
+                            "lastk": lastk,
+                            "fixed": fixed,
+                            "base_len": len(prefix) + len(lastk),
+                            "chunks_waited": 0,
+                            "words_after": 0
+                        }
+                    else:
+                        full_text = prefix + fixed
                 idle_counter = 0
             else:
                 carry_text = new_tail
 
+            # confirm pending punctuation with lookahead
+            if pending is not None:
+                pending["chunks_waited"] += 1
+                all_text = (full_text + carry_text)
+                extra = all_text[pending["base_len"]:]
+                pending["words_after"] = _count_tokens(extra)
+                force_by_chunks = pending["chunks_waited"] >= args.punct_lookahead_max_chunks
+                force_by_words  = pending["words_after"] >= args.punct_lookahead_words
+                force_by_idle   = idle_hit  # a new idle confirms sentence end
+                if force_by_words or force_by_chunks or force_by_idle:
+                    anchor = pending["prefix"] + pending["lastk"]
+                    if full_text.startswith(anchor):
+                        full_text = pending["prefix"] + pending["fixed"] + full_text[len(anchor):]
+                    else:
+                        idx = full_text.rfind(pending["lastk"])
+                        if idx != -1:
+                            full_text = full_text[:idx] + pending["fixed"] + full_text[idx+len(pending["lastk"]):]
+                        else:
+                            full_text = pending["prefix"] + pending["fixed"]
+                    pending = None
+
+            # render
             if args.show_tail:
-                if ansi_ok and args.twinkle_tail and carry_text:
+                if _supports_ansi() and args.twinkle_tail and carry_text:
                     deco = (ANSI_BLINK if blink else ANSI_REV) + ANSI_DIM
                     display = (full_text + f"{deco}{carry_text}{ANSI_RESET}").strip()
                 else:
                     display = (full_text + carry_text).strip()
             else:
                 display = full_text.strip()
-            line.write(display)
+            _LineWriter().write(display)
             blink = not blink
 
             q.popleft()
@@ -343,7 +361,7 @@ def stream_mic(args, model, char_dict):
 # ==================== Main ====================
 
 def main():
-    parser = argparse.ArgumentParser(description="ChunkFormer streaming with idle-triggered punctuation overlay")
+    parser = argparse.ArgumentParser(description="ChunkFormer streaming with idle-triggered punctuation and lookahead confirmation")
 
     parser.add_argument("--model_checkpoint", type=str, required=True)
     parser.add_argument("--max_duration", type=int, default=1800)
@@ -377,12 +395,18 @@ def main():
     parser.add_argument("--show_tail", action="store_true")
     parser.add_argument("--twinkle_tail", action="store_true")
 
-    # punctuator options (applied only on idle)
+    # punctuator options
     parser.add_argument("--punct", action="store_true")
     parser.add_argument("--punct_model", type=str, default="1-800-BAD-CODE/xlm-roberta_punctuation_fullstop_truecase")
     parser.add_argument("--punct_prov", type=str, choices=["cpu","cuda"], default="cpu")
     parser.add_argument("--punct_window_words", type=int, default=60)
     parser.add_argument("--punct_min_chars", type=int, default=40)
+
+    # lookahead confirmation
+    parser.add_argument("--punct_lookahead_words", type=int, default=3,
+                        help="Số từ mới cần thấy sau điểm chấm câu dự kiến để xác nhận.")
+    parser.add_argument("--punct_lookahead_max_chunks", type=int, default=6,
+                        help="Số vòng xử lý tối đa để tự xác nhận nếu người nói vẫn ngắt quãng.")
 
     args = parser.parse_args()
 
@@ -411,6 +435,8 @@ if __name__ == "__main__":
         "--max_tail_chars", "40",
         "--punct",
         "--punct_prov", "cpu",
+        "--punct_lookahead_words", "3",
+        "--punct_lookahead_max_chunks", "10",
         # "--show_tail",
         "--twinkle_tail",
     ]
