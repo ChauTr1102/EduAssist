@@ -1,15 +1,31 @@
-import os, math, argparse, yaml, re
+import os, math, argparse, yaml, re, sys, threading, queue, time
 import torch, torchaudio
 import numpy as np
 from collections import deque
 import torchaudio.compliance.kaldi as kaldi
+
+# ========== optional punctuator ==========
+try:
+    import onnxruntime as ort
+    from punctuators.models import PunctCapSegModelONNX
+except Exception:
+    ort = None
+    PunctCapSegModelONNX = None
 
 from model.utils.init_model import init_model
 from model.utils.checkpoint import load_checkpoint
 from model.utils.file_utils import read_symbol_table
 from model.utils.ctc_utils import get_output_with_timestamps, get_output, milliseconds_to_hhmmssms
 from api.private_config import *
-from model.utils.ctc_utils import get_output
+
+# ==================== ANSI ====================
+ANSI_RESET  = "\033[0m"
+ANSI_DIM    = "\033[2m"
+ANSI_REV    = "\033[7m"
+ANSI_BLINK  = "\033[5m"
+
+def _supports_ansi():
+    return sys.stdout.isatty() and os.environ.get("TERM", "") not in {"dumb", ""}
 
 # ==================== Text merge & stability ====================
 
@@ -60,11 +76,27 @@ def _smart_merge(prev_tail: str, cur_text: str, lcs_window=48, lcs_min=12):
     b = cur_text[:lcs_window]
     L, _ea, eb = _longest_common_substring(a, b)
     if L >= lcs_min:
-        return prev_tail + cur_text[eb:]  # bỏ trùng
+        return prev_tail + cur_text[eb:]
     return prev_tail + cur_text
 
 def _adaptive_reserve_words(overlap_ratio: float, base=1, hard=2, thresh=0.35):
     return hard if overlap_ratio < thresh else base
+
+def _split_prefix_last_k_words(text: str, k: int):
+    if k <= 0:
+        return text, ""
+    parts = re.split(r"(\s+|[.,!?;:…])", text)
+    words = []
+    buf = ""
+    for p in parts:
+        buf += p
+        if _WORD_BOUNDARY_RE.fullmatch(p or ""):
+            words.append(buf); buf = ""
+    if buf:
+        words.append(buf)
+    if len(words) <= k:
+        return "", "".join(words)
+    return "".join(words[:-k]), "".join(words[-k:])
 
 # ==================== Feature extractors ====================
 
@@ -92,7 +124,38 @@ def _kaldi_fbank_cpu(wav_1xT: torch.Tensor) -> torch.Tensor:
         wav_1xT.cpu(),
         num_mel_bins=80, frame_length=25, frame_shift=10,
         dither=0.0, energy_floor=0.0, sample_frequency=16000
-    ).unsqueeze(0)  # (1, T, 80)
+    ).unsqueeze(0)
+
+# ==================== Punctuator (synchronous on idle) ====================
+
+class _PunctSync:
+    def __init__(self, enabled: bool, model_name: str, providers: str, min_chars: int):
+        self.enabled = enabled and (PunctCapSegModelONNX is not None)
+        self.min_chars = min_chars
+        self._model = None
+        self._prov = providers
+        if not self.enabled:
+            return
+        try:
+            self._model = PunctCapSegModelONNX.from_pretrained(model_name)
+            prov = ["CPUExecutionProvider"] if self._prov == "cpu" else ["CUDAExecutionProvider", "CPUExecutionProvider"]
+            for name in dir(self._model):
+                obj = getattr(self._model, name)
+                if ort is not None and isinstance(obj, ort.InferenceSession):
+                    obj.set_providers(prov)
+        except Exception:
+            self.enabled = False
+
+    def punct(self, seg: str) -> str:
+        if not self.enabled:
+            return seg
+        s = seg.strip()
+        if len(s) < self.min_chars:
+            return seg
+        try:
+            return self._model.infer([seg], apply_sbd=False)[0]
+        except Exception:
+            return seg
 
 # ==================== Model init ====================
 
@@ -132,7 +195,6 @@ class _LineWriter:
     def write(self, s: str):
         s = s.replace("\n", " ")
         sys.stdout.write("\r" + s)
-        # xóa phần thừa nếu ngắn hơn lần trước
         extra = self.prev_len - len(s)
         if extra > 0:
             sys.stdout.write(" " * extra)
@@ -140,7 +202,7 @@ class _LineWriter:
         sys.stdout.flush()
         self.prev_len = len(s)
 
-# ==================== Microphone streaming (one-line display) ====================
+# ==================== Microphone streaming ====================
 
 @torch.no_grad()
 def stream_mic(args, model, char_dict):
@@ -170,15 +232,23 @@ def stream_mic(args, model, char_dict):
     look_blocks = max(0, int(math.ceil(args.lookahead_sec / args.stream_chunk_sec)))
 
     q = deque()
-    full_text = ""     # đã commit
-    carry_text = ""    # đuôi chưa commit
+    full_text = ""
+    carry_text = ""
     last_snapshot = ""
     idle_counter = 0
 
     fe = GPUMel80(device, sr) if args.use_gpu_mel else None
     line = _LineWriter()
+    blink = False
+    ansi_ok = _supports_ansi()
 
-    # không in dòng hướng dẫn để giữ “một hàng”
+    punct = _PunctSync(
+        enabled=args.punct,
+        model_name=args.punct_model,
+        providers=args.punct_prov,
+        min_chars=args.punct_min_chars
+    )
+
     with sd.InputStream(samplerate=sr, channels=1, dtype="float32", blocksize=block) as stream:
         while True:
             audio_block, _ = stream.read(block)
@@ -186,9 +256,13 @@ def stream_mic(args, model, char_dict):
             q.append(a)
 
             if len(q) < 1 + look_blocks:
-                # cập nhật hiển thị ngay cả khi chưa đủ lookahead
                 if args.show_tail and (full_text or carry_text):
-                    line.write(full_text + carry_text)
+                    tail_disp = carry_text
+                    if ansi_ok and args.twinkle_tail and carry_text:
+                        deco = (ANSI_BLINK if blink else ANSI_REV) + ANSI_DIM
+                        tail_disp = f"{deco}{carry_text}{ANSI_RESET}"
+                    line.write((full_text + tail_disp).strip())
+                    blink = not blink
                 continue
 
             seg_np = np.concatenate([q[0]] + list(list(q)[1:1 + look_blocks]))
@@ -217,7 +291,6 @@ def stream_mic(args, model, char_dict):
 
             chunk_text = get_output([hyp_step], char_dict)[0]
 
-            # smart merge
             merged = _smart_merge(carry_text, chunk_text, lcs_window=args.lcs_window, lcs_min=args.lcs_min)
             overlap_used = len(carry_text) + len(chunk_text) - len(merged)
             overlap_ratio = 0.0 if len(chunk_text) == 0 else max(0.0, min(1.0, overlap_used / max(1, len(chunk_text))))
@@ -231,42 +304,47 @@ def stream_mic(args, model, char_dict):
             idle_counter = 0 if progressed else (idle_counter + 1)
             last_snapshot = new_tail
 
-            # cập nhật buffer
             if commit:
                 full_text += commit
 
-            # ép commit đuôi theo các tiêu chí nhanh
-            do_force = False
-            if args.punct_flush and re.search(r"[.!?…。，、！？；：]\s*$", new_tail):
-                do_force = True
-            if len(new_tail) >= args.max_tail_chars:
-                do_force = True
-            if idle_counter >= args.idle_flush_chunks and new_tail.strip():
-                do_force = True
+            # commit tail when needed, but only punctuate on idle
+            punct_char_hit = bool(re.search(r"[.!?…。，、！？；：]\s*$", new_tail))
+            max_tail_hit = len(new_tail) >= args.max_tail_chars
+            idle_hit = (idle_counter >= args.idle_flush_chunks) and new_tail.strip()
 
-            if do_force and new_tail.strip():
-                # giữ khoảng trắng nếu có
+            commit_tail_now = punct_char_hit or max_tail_hit or idle_hit
+
+            if commit_tail_now and new_tail.strip():
                 full_text += new_tail
-                new_tail = ""
+                carry_text = ""
+                last_snapshot = ""
+                # punctuation only when idle pause detected
+                if args.punct and idle_hit:
+                    prefix, lastk = _split_prefix_last_k_words(full_text, args.punct_window_words)
+                    fixed = punct.punct(lastk)
+                    full_text = prefix + fixed
                 idle_counter = 0
+            else:
+                carry_text = new_tail
 
-            carry_text = new_tail
-
-            # one-line update
             if args.show_tail:
-                display = (full_text + carry_text).strip()
+                if ansi_ok and args.twinkle_tail and carry_text:
+                    deco = (ANSI_BLINK if blink else ANSI_REV) + ANSI_DIM
+                    display = (full_text + f"{deco}{carry_text}{ANSI_RESET}").strip()
+                else:
+                    display = (full_text + carry_text).strip()
             else:
                 display = full_text.strip()
             line.write(display)
+            blink = not blink
 
             q.popleft()
 
 # ==================== Main ====================
 
 def main():
-    parser = argparse.ArgumentParser(description="ChunkFormer streaming one-line (no timestamps)")
+    parser = argparse.ArgumentParser(description="ChunkFormer streaming with idle-triggered punctuation overlay")
 
-    # giữ nguyên tham số cũ
     parser.add_argument("--model_checkpoint", type=str, required=True)
     parser.add_argument("--max_duration", type=int, default=1800)
     parser.add_argument("--chunk_size", type=int, default=64)
@@ -283,7 +361,7 @@ def main():
     parser.add_argument("--print_final", action="store_true")
     parser.add_argument("--stream", action="store_true")
 
-    # ổn định văn bản
+    # text stability
     parser.add_argument("--stable_reserve_words", type=int, default=1)
     parser.add_argument("--adaptive_overlap_thresh", type=float, default=0.35)
     parser.add_argument("--lcs_window", type=int, default=48)
@@ -291,18 +369,22 @@ def main():
 
     parser.add_argument("--idle_flush_chunks", type=int, default=5)
     parser.add_argument("--max_tail_chars", type=int, default=40)
-    parser.add_argument("--punct_flush", action="store_true")
 
     # GPU mel
     parser.add_argument("--use_gpu_mel", action="store_true")
 
-    # cờ mới cho hiển thị
-    parser.add_argument("--show_tail", action="store_true",
-                        help="Hiển thị cả phần đuôi chưa ổn định trên cùng một hàng.")
+    # display
+    parser.add_argument("--show_tail", action="store_true")
+    parser.add_argument("--twinkle_tail", action="store_true")
+
+    # punctuator options (applied only on idle)
+    parser.add_argument("--punct", action="store_true")
+    parser.add_argument("--punct_model", type=str, default="1-800-BAD-CODE/xlm-roberta_punctuation_fullstop_truecase")
+    parser.add_argument("--punct_prov", type=str, choices=["cpu","cuda"], default="cpu")
+    parser.add_argument("--punct_window_words", type=int, default=60)
+    parser.add_argument("--punct_min_chars", type=int, default=40)
 
     args = parser.parse_args()
-
-    # không in header để giữ một hàng ngay từ đầu
 
     assert any([getattr(args, "mic", False), args.long_form_audio, args.audio_list]), "Cần --mic hoặc --long_form_audio hoặc --audio_list"
 
@@ -312,7 +394,6 @@ def main():
         stream_mic(args, model, char_dict); return
 
 if __name__ == "__main__":
-    import sys
     sys.argv = [
         "realtime_decode.py",
         "--model_checkpoint", CHUNKFORMER_CHECKPOINT,
@@ -322,13 +403,15 @@ if __name__ == "__main__":
         "--right_context_size", "8",
         "--stream_chunk_sec", "0.5",
         "--lookahead_sec", "0.2",
-        "--stable_reserve_words", "0",
+        "--stable_reserve_words", "1",
         "--lcs_window", "64",
         "--lcs_min", "16",
         "--use_gpu_mel",
-        "--idle_flush_chunks", "1 ",
+        "--idle_flush_chunks", "1",
         "--max_tail_chars", "40",
-        "--punct_flush",
+        "--punct",
+        "--punct_prov", "cpu",
         # "--show_tail",
+        "--twinkle_tail",
     ]
     main()
