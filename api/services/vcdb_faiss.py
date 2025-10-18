@@ -11,7 +11,7 @@ from langchain_community.vectorstores import FAISS
 import os
 from fastapi import UploadFile, File, Form
 import shutil
-from langchain.retrievers.ensemble import EnsembleRetriever
+# from langchain.retrievers.ensemble import EnsembleRetriever
 from langchain_community.retrievers import BM25Retriever
 from langchain_experimental.text_splitter import SemanticChunker
 import tiktoken
