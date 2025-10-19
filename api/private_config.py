@@ -1,0 +1,1 @@
+CHUNKFORMER_CHECKPOINT = "/home/trinhchau/code/EduAssist/api/services/chunkformer-large-vie"
