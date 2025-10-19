@@ -47,12 +47,21 @@ def on_update(event, payload, full):
                 faiss.add_transcript(transcript, start, end)
                 print("_______Added into vector store!__________")
 
+
+def just_print(event, payload, full):
+    """
+    event: "commit" | "flush" | "final_flush"
+    payload: {"start": int(ms), "end": int(ms), "text": str}
+    full: toàn bộ transcript tới thời điểm hiện tại (không dùng ở đây)
+    """
+    print(payload["text"], end=" ")
+
 final_text = chunkformer.stream_mic(
     stream_chunk_sec=0.5,
     left_context_size=128, right_context_size=8,
     mic_sr=16000, lookahead_sec=0.5,
     silence_rms=0.005, silence_runs=3,
-    stable_reserve_words=1,
+    stable_reserve_words=3,
     max_duration_sec=None,
-    on_update=on_update,
+    on_update=just_print,
 )
