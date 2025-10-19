@@ -485,12 +485,12 @@ if __name__ == "__main__":
 
         # Cân bằng giữa độ trễ và độ chính xác
         "--stream_chunk_sec", "0.5",  # Tăng nhẹ để có thêm ngữ cảnh
-        "--lookahead_sec", "0.2",
+        "--lookahead_sec", "0.5",
         "--left_context_size", "32",
-        "--right_context_size", "16",
+        "--right_context_size", "32",
 
         # Cài đặt để văn bản "chốt" nhanh và ít thay đổi
-        "--stable_reserve_words", "0",
+        "--stable_reserve_words", "1",
         "--idle_flush_chunks", "0",  # Chốt khi ngừng nói
         "--max_tail_chars", "40",
         # "--punct_flush",  # Chốt khi có dấu câu cuối câu
