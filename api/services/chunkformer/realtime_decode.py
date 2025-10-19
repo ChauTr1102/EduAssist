@@ -19,7 +19,6 @@ from api.private_config import CHUNKFORMER_CHECKPOINT
 try:
     import onnxruntime as ort
     from punctuators.models import PunctCapSegModelONNX
-
     _HAS_PUNCT = True
 except Exception:
     _HAS_PUNCT = False
@@ -69,7 +68,7 @@ def _split_commit_tail(text: str, reserve_last_k_words: int = 1):
     for p in parts:
         buf += p
         if _WORD_BOUNDARY_RE.fullmatch(p or ""):
-            words.append(buf);
+            words.append(buf)
             buf = ""
     if buf:
         words.append(buf)
@@ -161,7 +160,6 @@ class PunctWorker(threading.Thread):
                  model_id="1-800-BAD-CODE/xlm-roberta_punctuation_fullstop_truecase",
                  device="cuda", providers=("CUDAExecutionProvider", "CPUExecutionProvider"),
                  rate_hz=6.0,
-                 window_chars=640,  # Tham số này không còn tác dụng trực tiếp nhưng vẫn giữ để tương thích
                  reserve_words=1,
                  apply_sbd=False,
                  ansi_dim_tail=True,
@@ -171,7 +169,6 @@ class PunctWorker(threading.Thread):
         self.queue = queue.Queue(maxsize=1)
         self.stop_event = threading.Event()
         self.rate_hz = rate_hz
-        self.window_chars = window_chars  # Giữ lại để không phá vỡ CLI
         self.reserve_words = max(0, reserve_words)
         self.apply_sbd = apply_sbd
         self.ansi_dim_tail = ansi_dim_tail
@@ -206,31 +203,23 @@ class PunctWorker(threading.Thread):
             except Exception:
                 break
         try:
-            # put the full raw text
             self.queue.put_nowait(raw_text)
         except queue.Full:
             pass
 
-    def get_display(self, fallback: str) -> str:
+    def get_display(self, fallback: str):
         if self._have_overlay:
-            # Tách phần đã commit và phần đuôi từ chuỗi đã được xử lý
             commit, tail = _split_commit_tail(self._overlay, self.reserve_words)
             decorated_tail = self._decorate_tail(tail)
             return commit, decorated_tail
 
         commit, tail = _split_commit_tail(fallback, self.reserve_words)
-        return commit, self._decorate_tail(tail)  # Thêm decorate cho fallback
+        return commit, self._decorate_tail(tail)
 
     def _decorate_tail(self, text: str) -> str:
-        # Làm nhạt/nhấp-nháy phần đuôi chưa commit
         if not text or not _supports_ansi() or not self.ansi_dim_tail:
             return text
-        deco = text
-        if self.ansi_blink:
-            deco = ANSI_BLINK + deco + ANSI_RESET
-        else:
-            deco = ANSI_DIM + deco + ANSI_RESET
-        return deco
+        return (ANSI_BLINK + text + ANSI_RESET) if self.ansi_blink else (ANSI_DIM + text + ANSI_RESET)
 
     def run(self):
         if not self.enabled:
@@ -246,12 +235,9 @@ class PunctWorker(threading.Thread):
                 time.sleep(min_interval - (now - self._last_emit))
             self._last_emit = time.time()
 
-            # ONNX infer
+            # ONNX infer trên toàn bộ raw để tối đa ngữ cảnh
             try:
-                # <<< SỬA LỖI: Luôn xử lý toàn bộ văn bản `raw` >>>
-                # Bỏ việc cắt bớt `infer_text` để giữ toàn bộ ngữ cảnh.
                 out_list = self.m.infer([raw], apply_sbd=self.apply_sbd)
-
                 if isinstance(out_list, list) and out_list:
                     pred = out_list[0]
                     if isinstance(pred, dict) and "text" in pred:
@@ -260,14 +246,9 @@ class PunctWorker(threading.Thread):
                         pred = str(pred)
                 else:
                     pred = str(out_list)
-
-                # <<< SỬA LỖI: Gán trực tiếp kết quả đã xử lý >>>
-                # Không cần ghép nối với prefix thô nữa vì `pred` đã là kết quả
-                # của toàn bộ văn bản.
                 self._overlay = pred
-
             except Exception:
-                self._overlay = raw  # fallback to raw text on error
+                self._overlay = raw  # fallback
 
             self._have_overlay = True
 
@@ -304,7 +285,7 @@ def stream_mic(args, model, char_dict):
     look_blocks = max(0, int(math.ceil(args.lookahead_sec / args.stream_chunk_sec)))
 
     q = deque()
-    full_text = ""  # đã commit
+    full_text = ""   # đã commit
     carry_text = ""  # đuôi chưa commit
     last_snapshot = ""
     idle_counter = 0
@@ -319,7 +300,6 @@ def stream_mic(args, model, char_dict):
             device=("cuda" if args.punct_device == "gpu" else "cpu"),
             providers=("CUDAExecutionProvider", "CPUExecutionProvider"),
             rate_hz=args.punct_rate_hz,
-            window_chars=args.punct_window_chars,
             reserve_words=args.punct_reserve_words,
             apply_sbd=args.punct_apply_sbd,
             ansi_dim_tail=args.ansi_dim_tail,
@@ -337,11 +317,11 @@ def stream_mic(args, model, char_dict):
                 snapshot_raw = full_text + carry_text
 
                 if len(q) < 1 + look_blocks:
-                    if punct: punct.submit(snapshot_raw)
-                    # Cập nhật hiển thị ngay cả khi chưa có audio mới để hiệu ứng nhấp nháy hoạt động
-                    commit_display, tail_display = punct.get_display(snapshot_raw)
-
-                    # Xóa dòng hiện tại và in lại
+                    if punct:
+                        punct.submit(snapshot_raw)
+                        commit_display, tail_display = punct.get_display(snapshot_raw)
+                    else:
+                        commit_display, tail_display = snapshot_raw, ""
                     sys.stdout.write("\r\033[K")
                     display_text = commit_display + tail_display if args.show_tail else commit_display
                     sys.stdout.write(display_text.strip())
@@ -352,7 +332,7 @@ def stream_mic(args, model, char_dict):
                 seg = torch.from_numpy(seg_np).unsqueeze(0).to(device)
                 seg = seg * (1 << 15)
                 if seg.size(1) < int(0.025 * sr):
-                    q.popleft();
+                    q.popleft()
                     continue
 
                 x = _kaldi_fbank_cpu(seg).to(device) if fe is None else fe(seg)
@@ -408,14 +388,15 @@ def stream_mic(args, model, char_dict):
                 carry_text = new_tail
 
                 snapshot_raw = full_text + carry_text
-                if punct: punct.submit(snapshot_raw)
+                if punct:
+                    punct.submit(snapshot_raw)
 
-                commit_display_punct, tail_display_punct = punct.get_display(snapshot_raw)
+                commit_display_punct, tail_display_punct = punct.get_display(snapshot_raw) if punct else (snapshot_raw, "")
 
                 # Xóa toàn bộ dòng cũ để tránh ký tự rác
                 sys.stdout.write("\r\033[K")
 
-                # In ra văn bản hoàn chỉnh, terminal sẽ tự động xuống dòng khi cần
+                # In ra văn bản hoàn chỉnh
                 final_display = commit_display_punct + tail_display_punct if args.show_tail else commit_display_punct
                 sys.stdout.write(final_display.strip())
                 sys.stdout.flush()
@@ -424,7 +405,7 @@ def stream_mic(args, model, char_dict):
     finally:
         if punct:
             punct.stop()
-        print("\nStreaming finished.")  # In ra dòng mới khi kết thúc
+        print("\nStreaming finished.")  # newline khi kết thúc
 
 
 # ==================== CLI ====================
@@ -456,7 +437,6 @@ def build_arg_parser():
     p.add_argument("--punct_device", choices=["gpu", "cpu"], default="gpu",
                    help="Nếu 1 GPU chung với ASR bị tranh tài nguyên, đặt cpu.")
     p.add_argument("--punct_rate_hz", type=float, default=6.0)
-    p.add_argument("--punct_window_chars", type=int, default=640)
     p.add_argument("--punct_reserve_words", type=int, default=1)
     p.add_argument("--punct_apply_sbd", action="store_true",
                    help="Bật nếu muốn worker tự ngắt câu theo mô hình.")
@@ -484,16 +464,16 @@ if __name__ == "__main__":
         "--mic_sr", "16000",
 
         # Cân bằng giữa độ trễ và độ chính xác
-        "--stream_chunk_sec", "0.5",  # Tăng nhẹ để có thêm ngữ cảnh
+        "--stream_chunk_sec", "0.5",
         "--lookahead_sec", "0.5",
         "--left_context_size", "32",
         "--right_context_size", "32",
 
         # Cài đặt để văn bản "chốt" nhanh và ít thay đổi
         "--stable_reserve_words", "1",
-        "--idle_flush_chunks", "0",  # Chốt khi ngừng nói
+        "--idle_flush_chunks", "0",   # chốt khi ngừng nói
         "--max_tail_chars", "40",
-        # "--punct_flush",  # Chốt khi có dấu câu cuối câu
+        # "--punct_flush",           # chốt khi có dấu câu cuối câu (bật nếu muốn)
 
         # Tham số kỹ thuật
         "--lcs_window", "64",
@@ -502,13 +482,12 @@ if __name__ == "__main__":
 
         # Bật và cấu hình mô hình dấu câu
         "--enable_punct",
-        "--punct_device", "gpu",  # An toàn, tránh tranh chấp tài nguyên GPU
-        "--punct_rate_hz", "5.0",  # Tần suất cập nhật hợp lý
-        "--punct_window_chars", "2048",
-        "--punct_reserve_words", "0",  # Hiển thị 2 từ cuối ở dạng "đang chờ"
+        "--punct_device", "gpu",      # nếu tranh tài nguyên, đổi "cpu"
+        "--punct_rate_hz", "5.0",
+        "--punct_reserve_words", "0",
 
         # Hiệu ứng giao diện
-        "--ansi_dim_tail",  # Dùng hiệu ứng mờ (dễ nhìn hơn nhấp nháy)
+        "--ansi_dim_tail",
         "--show_tail",
     ]
     main()
