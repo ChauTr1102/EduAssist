@@ -11,7 +11,7 @@ from langchain_community.vectorstores import FAISS
 import os
 from fastapi import UploadFile, File, Form
 import shutil
-from langchain.retrievers.ensemble import EnsembleRetriever
+# from langchain.retrievers.ensemble import EnsembleRetriever
 from langchain_community.retrievers import BM25Retriever
 from langchain_experimental.text_splitter import SemanticChunker
 import tiktoken
@@ -84,10 +84,10 @@ class VectorStore:
 {"start": 0.858, "end":7.511, "text":{transcript}}, ...
 
         thành kiểu Document của Langchain:
-[Document(metadata={'speaker': 'SPEAKER_00', 'start_seconds': 0.858, 'end_seconds': 7.511, 'duration_seconds': 6.653, 'turn_id': 1, 'conversation_id': 'hop_nextstart'}, page_content='{transcript}'),
- Document(metadata={'speaker': 'SPEAKER_00', 'start_seconds': 7.531, 'end_seconds': 8.913, 'duration_seconds': 1.382, 'turn_id': 2, 'conversation_id': 'hop_nextstart'}, page_content='{transcript}'),
- Document(metadata={'speaker': 'SPEAKER_01', 'start_seconds': 8.934, 'end_seconds': 21.718, 'duration_seconds': 12.784, 'turn_id': 3, 'conversation_id': 'hop_nextstart'}, page_content='{transcript}'),
- Document(metadata={'speaker': 'SPEAKER_00', 'start_seconds': 44.952, 'end_seconds': 50.724, 'duration_seconds': 5.772, 'turn_id': 4, 'conversation_id': 'hop_nextstart'}, page_content='{transcript}')]
+[Document(metadata={'speaker': 'UNKNOWN', 'start_seconds': 0.858, 'end_seconds': 7.511, 'duration_seconds': 6.653, 'turn_id': 1, 'conversation_id': 'hop_nextstart'}, page_content='{transcript}'),
+ Document(metadata={'speaker': 'UNKNOWN', 'start_seconds': 7.531, 'end_seconds': 8.913, 'duration_seconds': 1.382, 'turn_id': 2, 'conversation_id': 'hop_nextstart'}, page_content='{transcript}'),
+ Document(metadata={'speaker': 'UNKNOWN', 'start_seconds': 8.934, 'end_seconds': 21.718, 'duration_seconds': 12.784, 'turn_id': 3, 'conversation_id': 'hop_nextstart'}, page_content='{transcript}'),
+ Document(metadata={'speaker': 'UNKNOWN', 'start_seconds': 44.952, 'end_seconds': 50.724, 'duration_seconds': 5.772, 'turn_id': 4, 'conversation_id': 'hop_nextstart'}, page_content='{transcript}')]
  """
 
         doc = utterances_to_documents_no_speakers(transcript, start, end, idx)
