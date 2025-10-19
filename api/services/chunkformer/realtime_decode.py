@@ -155,16 +155,13 @@ def init_asr(model_checkpoint):
     return model, char_dict
 
 
-# ==================== Single-line writer (ĐÃ BỎ, KHÔNG CÒN SỬ DỤNG) ====================
-# class _LineWriter: ...
-
 # ==================== Punctuation worker (song song) ====================
 class PunctWorker(threading.Thread):
     def __init__(self,
                  model_id="1-800-BAD-CODE/xlm-roberta_punctuation_fullstop_truecase",
                  device="cuda", providers=("CUDAExecutionProvider", "CPUExecutionProvider"),
                  rate_hz=6.0,
-                 window_chars=640,
+                 window_chars=640,  # Tham số này không còn tác dụng trực tiếp nhưng vẫn giữ để tương thích
                  reserve_words=1,
                  apply_sbd=False,
                  ansi_dim_tail=True,
@@ -174,20 +171,19 @@ class PunctWorker(threading.Thread):
         self.queue = queue.Queue(maxsize=1)
         self.stop_event = threading.Event()
         self.rate_hz = rate_hz
-        self.window_chars = window_chars
+        self.window_chars = window_chars  # Giữ lại để không phá vỡ CLI
         self.reserve_words = max(0, reserve_words)
         self.apply_sbd = apply_sbd
         self.ansi_dim_tail = ansi_dim_tail
         self.ansi_blink = ansi_blink and _supports_ansi()
         self._last_emit = 0.0
-        self._raw_seen = ""  # snapshot thô cuối cùng
         self._overlay = ""  # chuỗi đã gắn dấu để hiển thị
         self._have_overlay = False
 
         if self.enabled:
             # load model
             self.m = PunctCapSegModelONNX.from_pretrained(model_id)
-            # đặt providers ưu tiên GPU rồi CPU (tài liệu onnxruntime hướng dẫn set_providers) :contentReference[oaicite:0]{index=0}
+            # đặt providers ưu tiên GPU rồi CPU
             prov = list(providers) if device == "cuda" else ["CPUExecutionProvider"]
             for name in dir(self.m):
                 obj = getattr(self.m, name)
@@ -203,18 +199,14 @@ class PunctWorker(threading.Thread):
         if not self.enabled:
             return
 
-        # <<< FIX 1: LOẠI BỎ VIỆC CẮT BỚT DỮ LIỆU ĐẦU VÀO >>>
-        # Dòng code bị lỗi đã được xóa bỏ: `raw_text = raw_text[-self.window_chars:]`
-        # Giờ đây, toàn bộ lịch sử văn bản sẽ được xem xét.
-
-        self._raw_seen = raw_text
-        # drop older
+        # drop older items in queue
         while not self.queue.empty():
             try:
                 self.queue.get_nowait()
             except Exception:
                 break
         try:
+            # put the full raw text
             self.queue.put_nowait(raw_text)
         except queue.Full:
             pass
@@ -227,10 +219,10 @@ class PunctWorker(threading.Thread):
             return commit, decorated_tail
 
         commit, tail = _split_commit_tail(fallback, self.reserve_words)
-        return commit, tail
+        return commit, self._decorate_tail(tail)  # Thêm decorate cho fallback
 
     def _decorate_tail(self, text: str) -> str:
-        # Làm nhạt/nhấp-nháy phần đuôi chưa commit để người dùng thấy “đang suy nghĩ”
+        # Làm nhạt/nhấp-nháy phần đuôi chưa commit
         if not text or not _supports_ansi() or not self.ansi_dim_tail:
             return text
         deco = text
@@ -256,11 +248,11 @@ class PunctWorker(threading.Thread):
 
             # ONNX infer
             try:
-                # Chỉ xử lý phần cuối của văn bản để tiết kiệm tài nguyên
-                infer_text = raw[-self.window_chars:] if len(raw) > self.window_chars else raw
+                # <<< SỬA LỖI: Luôn xử lý toàn bộ văn bản `raw` >>>
+                # Bỏ việc cắt bớt `infer_text` để giữ toàn bộ ngữ cảnh.
+                out_list = self.m.infer([raw], apply_sbd=self.apply_sbd)
 
-                out_list = self.m.infer([infer_text], apply_sbd=self.apply_sbd)
-                if isinstance(out_list, list):
+                if isinstance(out_list, list) and out_list:
                     pred = out_list[0]
                     if isinstance(pred, dict) and "text" in pred:
                         pred = pred["text"]
@@ -269,16 +261,13 @@ class PunctWorker(threading.Thread):
                 else:
                     pred = str(out_list)
 
-                # Nối kết quả xử lý vào phần đầu của văn bản gốc
-                if len(raw) > self.window_chars:
-                    prefix = raw[:-self.window_chars]
-                    # Dùng smart_merge để nối mượt hơn
-                    self._overlay = _smart_merge(prefix, pred, lcs_window=32, lcs_min=8)
-                else:
-                    self._overlay = pred
+                # <<< SỬA LỖI: Gán trực tiếp kết quả đã xử lý >>>
+                # Không cần ghép nối với prefix thô nữa vì `pred` đã là kết quả
+                # của toàn bộ văn bản.
+                self._overlay = pred
 
             except Exception:
-                self._overlay = raw  # fallback
+                self._overlay = raw  # fallback to raw text on error
 
             self._have_overlay = True
 
@@ -322,9 +311,6 @@ def stream_mic(args, model, char_dict):
 
     fe = GPUMel80(device, sr) if args.use_gpu_mel else None
 
-    # <<< FIX 2: Bỏ _LineWriter và thay bằng logic in mới >>>
-    last_displayed_tail_len = 0  # Theo dõi độ dài của phần đuôi đã in ra
-
     # khởi động worker dấu câu nếu bật
     punct = None
     if args.enable_punct and _HAS_PUNCT:
@@ -352,14 +338,14 @@ def stream_mic(args, model, char_dict):
 
                 if len(q) < 1 + look_blocks:
                     if punct: punct.submit(snapshot_raw)
-                    # <<< FIX 2.1: Cập nhật hiển thị ngay cả khi chưa có audio mới >>>
+                    # Cập nhật hiển thị ngay cả khi chưa có audio mới để hiệu ứng nhấp nháy hoạt động
                     commit_display, tail_display = punct.get_display(snapshot_raw)
 
-                    # Xóa đuôi cũ và in lại toàn bộ
-                    sys.stdout.write("\r" + " " * last_displayed_tail_len + "\r")
-                    sys.stdout.write(commit_display + tail_display)
+                    # Xóa dòng hiện tại và in lại
+                    sys.stdout.write("\r\033[K")
+                    display_text = commit_display + tail_display if args.show_tail else commit_display
+                    sys.stdout.write(display_text.strip())
                     sys.stdout.flush()
-                    last_displayed_tail_len = len(commit_display) + len(tail_display)
                     continue
 
                 seg_np = np.concatenate([q[0]] + list(list(q)[1:1 + look_blocks]))
@@ -424,19 +410,14 @@ def stream_mic(args, model, char_dict):
                 snapshot_raw = full_text + carry_text
                 if punct: punct.submit(snapshot_raw)
 
-                # <<< FIX 2.2: Logic hiển thị mới >>>
                 commit_display_punct, tail_display_punct = punct.get_display(snapshot_raw)
 
-                # Hiển thị phần đã commit (có dấu câu) và phần đuôi (nhấp nháy)
                 # Xóa toàn bộ dòng cũ để tránh ký tự rác
                 sys.stdout.write("\r\033[K")
 
                 # In ra văn bản hoàn chỉnh, terminal sẽ tự động xuống dòng khi cần
-                final_display = (commit_display_punct + tail_display_punct).strip()
-                if not args.show_tail:
-                    final_display = commit_display_punct.strip()
-
-                sys.stdout.write(final_display)
+                final_display = commit_display_punct + tail_display_punct if args.show_tail else commit_display_punct
+                sys.stdout.write(final_display.strip())
                 sys.stdout.flush()
 
                 q.popleft()
@@ -495,31 +476,39 @@ def main():
 
 
 if __name__ == "__main__":
-    # ví dụ chạy nhanh
+    # Cấu hình ưu tiên độ ổn định và chính xác
     sys.argv = [
         "realtime_asr_punct.py",
         "--model_checkpoint", CHUNKFORMER_CHECKPOINT,
         "--mic",
         "--mic_sr", "16000",
-        "--left_context_size", "16",
-        "--right_context_size", "8",
-        "--stream_chunk_sec", "0.5",
+
+        # Cân bằng giữa độ trễ và độ chính xác
+        "--stream_chunk_sec", "0.5",  # Tăng nhẹ để có thêm ngữ cảnh
         "--lookahead_sec", "0.2",
+        "--left_context_size", "32",
+        "--right_context_size", "16",
+
+        # Cài đặt để văn bản "chốt" nhanh và ít thay đổi
         "--stable_reserve_words", "0",
+        "--idle_flush_chunks", "0",  # Chốt khi ngừng nói
+        "--max_tail_chars", "40",
+        # "--punct_flush",  # Chốt khi có dấu câu cuối câu
+
+        # Tham số kỹ thuật
         "--lcs_window", "64",
         "--lcs_min", "16",
         "--use_gpu_mel",
-        "--idle_flush_chunks", "1",
-        "--max_tail_chars", "40",
-        "--punct_flush",
+
+        # Bật và cấu hình mô hình dấu câu
         "--enable_punct",
-        "--punct_device", "gpu",
-        "--punct_rate_hz", "6.0",
-        "--punct_window_chars", "640",
-        "--punct_reserve_words", "1",
-        "--ansi_dim_tail",
-        # "--punct_apply_sbd"
-        "--ansi_blink_tail",
+        "--punct_device", "gpu",  # An toàn, tránh tranh chấp tài nguyên GPU
+        "--punct_rate_hz", "5.0",  # Tần suất cập nhật hợp lý
+        "--punct_window_chars", "2048",
+        "--punct_reserve_words", "0",  # Hiển thị 2 từ cuối ở dạng "đang chờ"
+
+        # Hiệu ứng giao diện
+        "--ansi_dim_tail",  # Dùng hiệu ứng mờ (dễ nhìn hơn nhấp nháy)
         "--show_tail",
     ]
     main()
