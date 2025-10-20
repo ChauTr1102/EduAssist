@@ -1,3 +1,6 @@
+# Cài đặt các thư viện cần thiết:
+# pip install torch torchaudio sounddevice numpy pyyaml onnxruntime onnxruntime-gpu punctuators
+
 import os
 import math
 import argparse
@@ -5,18 +8,26 @@ import yaml
 import re
 import sys
 from collections import deque
+import threading
+import queue
+import time
 
+# Punctuation model imports
+import onnxruntime as ort
+from punctuators.models import PunctCapSegModelONNX
+
+# ASR model imports
 import torch
 import numpy as np
 import sounddevice as sd
 import torchaudio
 import torchaudio.compliance.kaldi as kaldi
 
+# Giả định các file utils của ChunkFormer nằm trong thư mục 'model'
 from model.utils.init_model import init_model
 from model.utils.checkpoint import load_checkpoint
 from model.utils.file_utils import read_symbol_table
 from model.utils.ctc_utils import get_output
-
 
 # ==================== Utils ====================
 
@@ -26,7 +37,6 @@ def _longest_suffix_prefix_overlap(a: str, b: str, max_k: int = 32) -> int:
         if a[-L:] == b[:L]:
             return L
     return 0
-
 
 _WORD_BOUNDARY_RE = re.compile(r"[ \t\n\r\f\v.,!?;:…，。！？；：]")
 
@@ -49,299 +59,272 @@ def _split_commit_tail(text: str, reserve_last_k_words: int = 1):
     tail = "".join(words[-reserve_last_k_words:])
     return commit, tail
 
-def _rms(x: np.ndarray) -> float:
-    if x.size == 0:
-        return 0.0
-    return float(np.sqrt(np.mean(x.astype(np.float32) ** 2)))
-
-def _take_last_k_words(s: str, k: int):
-    """Cắt k từ cuối của s. Trả về (remain, last_k)."""
-    if k <= 0 or not s:
-        return s, ""
-    tokens = re.split(r"(\s+|[.,!?;:…])", s)
-    # gom lại theo ranh giới
-    words = []
-    buf = ""
-    for t in tokens:
-        buf += t
-        if _WORD_BOUNDARY_RE.fullmatch(t or ""):
-            words.append(buf)
-            buf = ""
-    if buf:
-        words.append(buf)
-    if not words:
-        return "", s
-    if k >= len(words):
-        return "", "".join(words)
-    keep = "".join(words[:-k])
-    lastk = "".join(words[-k:])
-    return keep, lastk
-
-def _first_k_words(s: str, k: int):
-    if k <= 0 or not s:
-        return "", s
-    tokens = re.split(r"(\s+|[.,!?;:…])", s)
-    words = []
-    buf = ""
-    for t in tokens:
-        buf += t
-        if _WORD_BOUNDARY_RE.fullmatch(t or ""):
-            words.append(buf)
-            buf = ""
-    if buf:
-        words.append(buf)
-    if not words:
-        return "", s
-    if k >= len(words):
-        return s, ""
-    first = "".join(words[:k])
-    remain = "".join(words[k:])
-    return first, remain
-
-
-# ==================== Model init ====================
+# ==================== ASR Worker Thread ====================
 
 @torch.no_grad()
-def init(model_checkpoint):
-    torch.set_float32_matmul_precision("high")
-    torch.backends.cudnn.benchmark = True
-
-    config_path = os.path.join(model_checkpoint, "config.yaml")
-    checkpoint_path = os.path.join(model_checkpoint, "pytorch_model.bin")
-    symbol_table_path = os.path.join(model_checkpoint, "vocab.txt")
-
-    with open(config_path, 'r') as fin:
-        config = yaml.load(fin, Loader=yaml.FullLoader)
-    model = init_model(config, config_path)
-    model.eval()
-    load_checkpoint(model, checkpoint_path)
-
-    model.encoder = model.encoder.cuda()
-    model.ctc = model.ctc.cuda()
-
-    symbol_table = read_symbol_table(symbol_table_path)
-    char_dict = {v: k for k, v in symbol_table.items()}
-
-    return model, char_dict
-
-
-# ==================== Streaming with stall-based soft commit ====================
-
-@torch.no_grad()
-def stream_mic(args, model, char_dict):
+def asr_worker(args, asr_model, char_dict, raw_text_queue):
+    """
+    Luồng chạy ngầm: ASR -> đẩy text thô vào queue.
+    Cơ chế flush: nếu không có tiến triển giải mã trong N chunk liên tiếp => flush tail.
+    """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    subsampling = model.encoder.embed.subsampling_factor
-    num_layers = model.encoder.num_blocks
-    conv_lorder = model.encoder.cnn_module_kernel // 2
+    subsampling = asr_model.encoder.embed.subsampling_factor
+    num_layers = asr_model.encoder.num_blocks
+    conv_lorder = asr_model.encoder.cnn_module_kernel // 2
 
+    # quy đổi stream_chunk_sec thành số bước encoder
     enc_steps = max(1, int(round((args.stream_chunk_sec / 0.01) / subsampling)))
     chunk_size = enc_steps
     left_context_size = args.left_context_size
     right_context_size = args.right_context_size
 
     att_cache = torch.zeros(
-        (num_layers, left_context_size, model.encoder.attention_heads,
-         model.encoder._output_size * 2 // model.encoder.attention_heads),
+        (num_layers, left_context_size,
+         asr_model.encoder.attention_heads,
+         asr_model.encoder._output_size * 2 // asr_model.encoder.attention_heads),
         device=device
     )
-    cnn_cache = torch.zeros((num_layers, model.encoder._output_size, conv_lorder), device=device)
+    cnn_cache = torch.zeros(
+        (num_layers, asr_model.encoder._output_size, conv_lorder),
+        device=device
+    )
     offset = torch.zeros(1, dtype=torch.int, device=device)
 
     sr = args.mic_sr
-    assert sr == 16000, "Mic nên 16 kHz"
     block_samples = int(args.stream_chunk_sec * sr)
     lookahead_blocks = max(0, int(math.ceil(args.lookahead_sec / args.stream_chunk_sec)))
 
     q = deque()
-    hard_text = ""        # khóa cứng, không hồi tố
-    soft_text = ""        # khóa mềm, có thể hồi tố trong cửa sổ
-    carry_text = ""       # đuôi chưa commit
-    prev_display = ""
-    no_new_char_chunks = 0
+    carry_text = ""
+    stall_runs = 0  # đếm số chunk liên tiếp không tiến triển
+    last_tail = ""  # tail của vòng trước để so sánh
 
-    # Tham số cơ chế stall
-    STALL_N = args.stall_n_chunks           # số chunk liên tiếp không có ký tự mới
-    SOFT_COMMIT_WORDS = args.soft_commit_words_per_stall  # số từ chuyển từ carry -> soft khi stall
-    SOFT_WINDOW = args.soft_window_words    # tối đa số từ có thể hồi tố trong soft
-    ROLLBACK_WORDS = args.soft_rollback_words  # khi có nói tiếp, hồi tối đa bấy nhiêu từ từ soft
-
-    SIL_THRESH = args.silence_rms
-    silence_run = 0
-
-    print("Mic streaming. Ctrl+C để dừng.")
+    print("ASR worker started. Listening...")
     try:
         with sd.InputStream(samplerate=sr, channels=1, dtype="float32", blocksize=block_samples) as stream:
-            while True:
+            while not args.stop_event.is_set():
                 audio_block, _ = stream.read(block_samples)
                 a = np.squeeze(audio_block, axis=1).astype(np.float32)
                 q.append(a)
 
-                if _rms(a) < SIL_THRESH:
-                    silence_run += 1
-                else:
-                    silence_run = 0
-
+                # đủ lookahead để suy luận
                 if len(q) < 1 + lookahead_blocks:
                     continue
 
+                # tạo segment: block hiện tại + lookahead
                 seg_np = np.concatenate([q[0]] + list(list(q)[1:1 + lookahead_blocks]))
                 seg = torch.from_numpy(seg_np).unsqueeze(0).to(device) * (1 << 15)
 
+                # bảo vệ đoạn quá ngắn
                 if seg.size(1) < int(0.025 * sr):
                     q.popleft()
                     continue
 
+                # FBANK
                 x = kaldi.fbank(
-                    seg, num_mel_bins=80, frame_length=25, frame_shift=10,
-                    dither=0.0, energy_floor=0.0, sample_frequency=16000
+                    seg,
+                    num_mel_bins=80,
+                    frame_length=25,
+                    frame_shift=10,
+                    dither=0.0,
+                    energy_floor=0.0,
+                    sample_frequency=16000
                 ).unsqueeze(0).to(device)
                 x_len = torch.tensor([x.size(1)], dtype=torch.int, device=device)
 
-                truncated_context_size = chunk_size
+                # Encoder + CTC step
                 with torch.cuda.amp.autocast(dtype=torch.float16):
-                    enc_out, enc_len, _, att_cache, cnn_cache, offset = model.encoder.forward_parallel_chunk(
-                        xs=x, xs_origin_lens=x_len, chunk_size=chunk_size,
-                        left_context_size=left_context_size, right_context_size=right_context_size,
-                        att_cache=att_cache, cnn_cache=cnn_cache,
-                        truncated_context_size=truncated_context_size, offset=offset
+                    enc_out, enc_len, _, att_cache, cnn_cache, offset = asr_model.encoder.forward_parallel_chunk(
+                        xs=x,
+                        xs_origin_lens=x_len,
+                        chunk_size=chunk_size,
+                        left_context_size=left_context_size,
+                        right_context_size=right_context_size,
+                        att_cache=att_cache,
+                        cnn_cache=cnn_cache,
+                        truncated_context_size=chunk_size,
+                        offset=offset
                     )
                     enc_out = enc_out.reshape(1, -1, enc_out.size(-1))[:, :enc_len]
-                    if enc_out.size(1) > truncated_context_size:
-                        enc_out = enc_out[:, :truncated_context_size]
+                    if enc_out.size(1) > chunk_size:
+                        enc_out = enc_out[:, :chunk_size]
                     offset = offset - enc_len + enc_out.size(1)
-                    hyp_step = model.encoder.ctc_forward(enc_out).squeeze(0).cpu()
+                    hyp_step = asr_model.encoder.ctc_forward(enc_out).squeeze(0).cpu()
 
                 chunk_text = get_output([hyp_step], char_dict)[0]
 
-                # Hợp nhất đuôi trước đó với decode mới
+                # hợp nhất với carry bằng LPS overlap
                 ov = _longest_suffix_prefix_overlap(carry_text, chunk_text, max_k=32)
-                merged_tail = carry_text + chunk_text[ov:]
+                merged = carry_text + chunk_text[ov:]
 
-                # Chia commit/tail theo ranh giới từ ổn định
-                commit_part, new_tail = _split_commit_tail(merged_tail, reserve_last_k_words=max(1, args.stable_reserve_words))
+                # tách commit/tail theo số từ dự trữ
+                commit, new_tail = _split_commit_tail(
+                    merged,
+                    reserve_last_k_words=max(1, args.stable_reserve_words)
+                )
 
-                # Áp commit tạm thời vào soft (không vượt quá SOFT_WINDOW)
-                if commit_part:
-                    soft_text += commit_part
+                # đẩy phần commit ổn định
+                if commit:
+                    raw_text_queue.put(commit)
 
-                # Giới hạn cửa sổ hồi tố: đẩy phần đầu soft sang hard nếu soft quá dài
-                # đo theo số từ
-                _, soft_excess = _first_k_words(soft_text, max(0, len(re.split(r"(\s+|[.,!?;:…])", soft_text))))  # dummy call
-                # tính nhanh số từ bằng regex split theo ranh giới
-                def _count_words(s: str) -> int:
-                    parts = re.split(r"(\s+|[.,!?;:…])", s)
-                    words = []
-                    buf = ""
-                    for p in parts:
-                        buf += p
-                        if _WORD_BOUNDARY_RE.fullmatch(p or ""):
-                            words.append(buf)
-                            buf = ""
-                    if buf:
-                        words.append(buf)
-                    return len(words)
+                # đánh giá tiến triển: nếu không có commit mới và tail không đổi => stall
+                progressed = bool(commit) or (new_tail != last_tail)
 
-                while _count_words(soft_text) > SOFT_WINDOW:
-                    first, remain = _first_k_words(soft_text, _count_words(soft_text) - SOFT_WINDOW)
-                    hard_text += first
-                    soft_text = remain
-
-                # Tính hiển thị hiện tại
-                display_now = f"{hard_text}{soft_text}{new_tail}"
-
-                # Phát hiện stall: không có ký tự mới xuất hiện
-                if display_now.strip() == prev_display.strip():
-                    no_new_char_chunks += 1
+                if progressed:
+                    stall_runs = 0
                 else:
-                    no_new_char_chunks = 0
+                    stall_runs += 1
 
-                # Nếu stall đủ lâu, chuyển một số từ từ tail sang soft để "chốt" mà vẫn hồi tố được
-                if no_new_char_chunks >= STALL_N and new_tail:
-                    move, remain = _first_k_words(new_tail, SOFT_COMMIT_WORDS)
-                    soft_text += move
-                    new_tail = remain
-                    no_new_char_chunks = 0  # reset sau khi chốt mềm
-
-                # Nếu người nói tiếp tục và có thay đổi đáng kể, rollback một phần soft để cho phép sửa
-                # Hàm kích hoạt: có ký tự mới và trước đó từng stall hoặc có im lặng kết thúc
-                resumed_speech = (_rms(a) >= SIL_THRESH) and (display_now.strip() != prev_display.strip())
-                if resumed_speech and ROLLBACK_WORDS > 0:
-                    # kéo lại ROLLBACK_WORDS từ soft quay về tail để tái đánh giá cùng decode mới
-                    soft_text, rollback_chunk = _take_last_k_words(soft_text, ROLLBACK_WORDS)
-                    if rollback_chunk:
-                        # gắn trước tail rồi hợp nhất lại với decode hiện tại ở vòng sau
-                        new_tail = rollback_chunk + new_tail
-
-                # Flush khi im lặng dài (bảo toàn)
-                if silence_run >= args.silence_runs and new_tail.strip():
-                    soft_text += new_tail
+                # nếu stall đủ N chunk => flush tail để hiển thị
+                if stall_runs >= args.no_progress_patience and new_tail.strip():
+                    raw_text_queue.put(new_tail)
                     new_tail = ""
+                    stall_runs = 0
 
-                # In ra
-                print(f"\r{hard_text.strip()} {soft_text.strip()} {new_tail.strip()}",
-                      end="", flush=True)
-
-                # Cập nhật trạng thái
+                # cập nhật carry và last_tail
                 carry_text = new_tail
-                prev_display = f"{hard_text}{soft_text}{new_tail}"
+                last_tail = new_tail
+
+                # trượt cửa sổ
                 q.popleft()
-                torch.cuda.empty_cache()
-    except KeyboardInterrupt:
-        print("\nĐã dừng.")
 
+    except Exception as e:
+        print(f"Error in ASR worker: {e}")
+    finally:
+        # flush phần tail còn lại khi dừng
+        if carry_text.strip():
+            raw_text_queue.put(carry_text)
+        raw_text_queue.put(None)
+        print("ASR worker finished.")
 
-# ==================== Main ====================
+# ==================== Model init ====================
+
+@torch.no_grad()
+def init_asr_model(args):
+    torch.set_float32_matmul_precision("high")
+    torch.backends.cudnn.benchmark = True
+    config_path = os.path.join(args.model_checkpoint, "config.yaml")
+    checkpoint_path = os.path.join(args.model_checkpoint, "pytorch_model.bin")
+    symbol_table_path = os.path.join(args.model_checkpoint, "vocab.txt")
+    with open(config_path, 'r') as fin:
+        config = yaml.load(fin, Loader=yaml.FullLoader)
+    model = init_model(config, config_path)
+    model.eval()
+    load_checkpoint(model, checkpoint_path)
+    model.encoder = model.encoder.cuda()
+    model.ctc = model.ctc.cuda()
+    symbol_table = read_symbol_table(symbol_table_path)
+    char_dict = {v: k for k, v in symbol_table.items()}
+    return model, char_dict
+
+def init_punctuation_model(args):
+    print(f"Loading punctuation model: {args.punc_model}")
+    m = PunctCapSegModelONNX.from_pretrained(args.punc_model)
+    if args.punc_device == "cuda":
+        prov = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+        print("Punctuation model will run on CUDA (with CPU fallback).")
+    else:
+        prov = ["CPUExecutionProvider"]
+        print("Punctuation model will run on CPU.")
+    for name in dir(m):
+        obj = getattr(m, name)
+        if isinstance(obj, ort.InferenceSession):
+            obj.set_providers(prov)
+    print("Punctuation model loaded.")
+    return m
+
+# ==================== Main Thread: Punctuation and Display ====================
 
 def main():
-    parser = argparse.ArgumentParser(description="ChunkFormer Microphone Streaming")
+    parser = argparse.ArgumentParser(description="Real-time ASR with Rewritable Punctuation")
 
-    parser.add_argument("--model_checkpoint", type=str, required=True)
-    parser.add_argument("--chunk_size", type=int, default=64)
-    parser.add_argument("--left_context_size", type=int, default=128)
-    parser.add_argument("--right_context_size", type=int, default=16)
-    parser.add_argument("--mic_sr", type=int, default=16000)
-    parser.add_argument("--stream_chunk_sec", type=float, default=0.5)
-    parser.add_argument("--lookahead_sec", type=float, default=0.2)
-    parser.add_argument("--stable_reserve_words", type=int, default=1)
-    parser.add_argument("--silence_rms", type=float, default=0.005)
-    parser.add_argument("--silence_runs", type=int, default=3)
+    # --- Tham số cho model ASR ---
+    asr_parser = parser.add_argument_group("ASR Model & Streaming Parameters")
+    asr_parser.add_argument("--model_checkpoint", type=str, required=True, help="Path to ASR model directory")
+    asr_parser.add_argument("--chunk_size", type=int, default=64)
+    asr_parser.add_argument("--left_context_size", type=int, default=128)
+    asr_parser.add_argument("--right_context_size", type=int, default=16)
+    asr_parser.add_argument("--mic_sr", type=int, default=16000)
+    asr_parser.add_argument("--stream_chunk_sec", type=float, default=0.5)
+    asr_parser.add_argument("--lookahead_sec", type=float, default=0.2)
+    asr_parser.add_argument("--stable_reserve_words", type=int, default=2)
+    # MỚI: patience theo số chunk không tiến triển
+    asr_parser.add_argument("--no_progress_patience", type=int, default=3,
+                            help="Flush tail nếu không có tiến triển giải mã trong N chunk liên tiếp.")
 
-    # Tham số cơ chế stall + soft-commit
-    parser.add_argument("--stall_n_chunks", type=int, default=3,
-                        help="Số chunk liên tiếp không thay đổi để chốt mềm")
-    parser.add_argument("--soft_commit_words_per_stall", type=int, default=1,
-                        help="Số từ chuyển từ tail sang soft mỗi lần stall")
-    parser.add_argument("--soft_window_words", type=int, default=8,
-                        help="Cửa sổ tối đa (số từ) có thể hồi tố trong soft")
-    parser.add_argument("--soft_rollback_words", type=int, default=3,
-                        help="Khi nói tiếp, rollback bấy nhiêu từ từ soft về tail để cho phép sửa")
+    # Punctuation
+    punc_parser = parser.add_argument_group("Punctuation Model Parameters")
+    punc_parser.add_argument("--punc_model", type=str, default="1-800-BAD-CODE/xlm-roberta_punctuation_fullstop_truecase",
+                              help="Name of the punctuation model from Hugging Face.")
+    punc_parser.add_argument("--punc_device", type=str, default="cuda", choices=["cuda", "cpu"],
+                              help="Device to run the punctuation model on.")
+    punc_parser.add_argument("--use_sbd", action="store_true", help="Enable Sentence Boundary Detection in the punctuation model.")
 
     args = parser.parse_args()
+    args.stop_event = threading.Event()
 
-    print(f"Model Checkpoint: {args.model_checkpoint}")
-    print(f"Chunk Size: {args.chunk_size}")
-    print(f"L/R Context: {args.left_context_size}/{args.right_context_size}")
+    # --- Khởi tạo ---
+    asr_model, char_dict = init_asr_model(args)
+    punctuation_model = init_punctuation_model(args)
+    raw_text_queue = queue.Queue()
 
-    model, char_dict = init(args.model_checkpoint)
-    stream_mic(args, model, char_dict)
+    # --- Khởi chạy luồng ASR ngầm ---
+    asr_thread = threading.Thread(
+        target=asr_worker,
+        args=(args, asr_model, char_dict, raw_text_queue)
+    )
+    asr_thread.start()
+
+    # --- Vòng lặp chính: Chuẩn hóa và Hiển thị ---
+    raw_transcript = ""
+    last_displayed_text = ""
+
+    print("\nMic streaming. Nhấn Ctrl+C để dừng.")
+    try:
+        while True:
+            new_text_received = False
+            while not raw_text_queue.empty():
+                chunk = raw_text_queue.get()
+                if chunk is None:
+                    args.stop_event.set()
+                    break
+                raw_transcript += chunk
+                new_text_received = True
+
+            if args.stop_event.is_set() and raw_text_queue.empty():
+                break
+
+            if new_text_received and raw_transcript.strip():
+                punctuated_hypothesis = punctuation_model.infer(
+                    [raw_transcript], apply_sbd=args.use_sbd
+                )[0]
+                last_displayed_text = punctuated_hypothesis
+
+            print(f"\r{last_displayed_text.strip()} ", end="", flush=True)
+            time.sleep(0.1)
+
+    except KeyboardInterrupt:
+        print("\nĐang dừng...")
+        args.stop_event.set()
 
 
 if __name__ == "__main__":
-    # ví dụ chạy nhanh
+    # Gán các tham số mặc định để chạy trực tiếp script
     sys.argv = [
-        "stream_mic.py",
+        "stream_mic_configurable.py",
+        # --- ASR PARAMS ---
         "--model_checkpoint", "/home/trinhchau/code/EduAssist/api/services/chunkformer-large-vie",
         "--mic_sr", "16000",
         "--left_context_size", "128",
-        "--right_context_size", "16",
+        "--right_context_size", "32",
         "--stream_chunk_sec", "0.5",
         "--lookahead_sec", "0.5",
         "--stable_reserve_words", "2",
-        "--silence_runs", "1",
-        "--stall_n_chunks", "2",
-        "--soft_commit_words_per_stall", "1",
-        "--soft_window_words", "6",
-        "--soft_rollback_words", "3",
-        "--silence_rms", "0.005"
+        # MỚI: patience không tiến triển
+        "--no_progress_patience", "1",
+        # Punctuation
+        "--punc_model", "1-800-BAD-CODE/xlm-roberta_punctuation_fullstop_truecase",
+        "--punc_device", "cuda",
+        # "--use_sbd",
     ]
     main()
