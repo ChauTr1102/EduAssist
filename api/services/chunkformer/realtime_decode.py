@@ -1,9 +1,3 @@
-# ===============================================
-# stream_mic_paper_ready_optimized.py
-# Real-time ChunkFormer ASR + Sliding-window Punctuation (+decap)
-# ===============================================
-# pip install torch torchaudio sounddevice numpy pyyaml onnxruntime-gpu punctuators colorama
-
 import os, math, argparse, yaml, re, sys, threading, queue, contextlib
 from collections import deque
 
@@ -31,10 +25,11 @@ colorama.init(autoreset=True)
 YELLOW = colorama.Fore.YELLOW
 BLUE   = colorama.Fore.BLUE
 
-# ===== token & casing utils =====
+# ===== token & regex =====
 _TOKEN_RE   = re.compile(r"\S+")
 END_SENT_RE = re.compile(r"[\.!\?…]\s*$", re.UNICODE)
 
+# ===== helpers =====
 def advance_pointer_by_words(full_text: str, start_idx: int, n_words: int) -> int:
     cnt = 0
     for m in _TOKEN_RE.finditer(full_text, start_idx):
@@ -98,7 +93,7 @@ def asr_worker(args, asr_model, char_dict, hypothesis_queue):
 
                 seg_np = np.concatenate(q_audio, dtype=np.float32)
                 seg = torch.from_numpy(seg_np).unsqueeze(0).to(device) * 32768.0
-                if seg.size(1) < int(0.025 * sr):  # bảo vệ fbank
+                if seg.size(1) < int(0.025 * sr):
                     continue
 
                 x = kaldi.fbank(
@@ -184,7 +179,7 @@ def init_punctuation_model(args):
 
 # ===== main =====
 def main():
-    parser = argparse.ArgumentParser(description="Real-time ASR with sliding-window punctuation (optimized + decap)")
+    parser = argparse.ArgumentParser(description="Realtime ASR + punctuation with safe context-overlap")
     ap = parser.add_argument_group("ASR")
     ap.add_argument("--model_checkpoint", type=str, required=True)
     ap.add_argument("--mic_sr", type=int, default=16000)
@@ -202,8 +197,8 @@ def main():
     pp.add_argument("--punc_window_words", type=int, default=24)
     pp.add_argument("--punc_commit_margin_words", type=int, default=8)
     pp.add_argument("--punc_processing_window_words", type=int, default=40)
-    pp.add_argument("--disable_truecase", action="store_true",
-                    help="Nếu bật, hạ lowercase toàn bộ output punctuation window.")
+    pp.add_argument("--punc_context_overlap_words", type=int, default=3,
+                    help="Số từ từ phần đã commit đưa vào đầu cửa sổ punctuation làm ngữ cảnh.")
 
     args = parser.parse_args()
     args.stop_event = threading.Event()
@@ -243,15 +238,28 @@ def main():
             tokens_tail = _TOKEN_RE.findall(tail_raw)
             if not tokens_tail:
                 continue
+
+            # ---- context-overlap an toàn ----
             N = args.punc_processing_window_words
-            window_tokens = tokens_tail[-N:]
+            K_cfg = max(0, int(args.punc_context_overlap_words))
+            # K = 0 cho lần đầu (tránh cắt nhầm), sau đó dùng K_cfg
+            K = 0 if committed_ptr == 0 else K_cfg
+
+            context_tokens = _TOKEN_RE.findall(committed_text.strip())[-K:] if K > 0 and committed_text.strip() else []
+            window_tokens = context_tokens + tokens_tail[-N:]
             processing_window_raw = " ".join(window_tokens)
 
             punct_window = punc_model.infer([processing_window_raw], apply_sbd=args.use_sbd)[0]
-            if args.disable_truecase:
-                punct_window = punct_window.lower()
-            punct_tokens = _TOKEN_RE.findall(punct_window)
 
+            # cắt bỏ đúng số token context thực sự đã ghép
+            punct_tokens_full = _TOKEN_RE.findall(punct_window)
+            actual_k = len(context_tokens)
+            if actual_k > 0 and len(punct_tokens_full) > actual_k:
+                punct_tokens = punct_tokens_full[actual_k:]
+            else:
+                punct_tokens = punct_tokens_full
+
+            # commit + active
             if len(punct_tokens) > args.punc_window_words:
                 commit_k = len(punct_tokens) - args.punc_commit_margin_words
                 commit_text = " ".join(punct_tokens[:commit_k]) + " "
@@ -262,10 +270,11 @@ def main():
             else:
                 active_text = " ".join(punct_tokens)
 
-            # decap nếu trước đó chưa kết thúc câu
-            if active_text and not END_SENT_RE.search(committed_text):
+            # fallback: nếu trước đó chưa có dấu kết câu rõ ràng, hạ chữ đầu active
+            if active_text and not END_SENT_RE.search(committed_text.strip()):
                 active_text = decap_first_token(active_text)
 
+            # render
             active_words = _TOKEN_RE.findall(active_text)
             if len(active_words) > args.punc_commit_margin_words:
                 head = " ".join(active_words[:-args.punc_commit_margin_words])
@@ -285,10 +294,7 @@ def main():
         t.join()
         tail_raw = raw_text[committed_ptr:]
         if tail_raw.strip():
-            final_piece = punc_model.infer([tail_raw])[0]
-            if args.disable_truecase:
-                final_piece = final_piece.lower()
-            committed_text += final_piece
+            committed_text += punc_model.infer([tail_raw])[0]
         print(f"\r{committed_text.strip()} ")
         print("\nDone.")
 
@@ -296,17 +302,17 @@ def main():
 if __name__ == "__main__":
     if len(sys.argv) == 1:
         sys.argv = [
-            "stream_mic_paper_ready_optimized.py",
+            "realtime_decode.py",
             "--model_checkpoint", "/home/trinhchau/code/EduAssist/api/services/chunkformer-large-vie",
+            "--punc_device", "cuda",
             "--stream_chunk_sec", "0.5",
             "--lookahead_sec", "0.5",
+            "--punc_processing_window_words", "300",
+            "--punc_window_words", "240",
+            "--punc_commit_margin_words", "80",
+            "--punc_context_overlap_words", "3",
             "--left_context_size", "128",
             "--right_context_size", "32",
-            "--punc_window_words", "24",
-            "--punc_commit_margin_words", "8",
-            "--punc_processing_window_words", "40",
-            "--punc_device", "cuda",
             "--cpu_threads", "1",
-            # "--disable_truecase",    # mở nếu cần tắt truecasing
         ]
     main()
