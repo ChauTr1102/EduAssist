@@ -4,6 +4,7 @@ from api.services.chunkformer_stt import ChunkFormer
 from punctuators.models import PunctCapSegModelONNX
 from api.private_config import *
 from api.services.vcdb_faiss import VectorStore
+from utils.time_format import ms_to_hms_pad
 import warnings
 warnings.filterwarnings("ignore")
 
@@ -13,7 +14,7 @@ chunkformer = ChunkFormer(model_checkpoint=CHUNKFORMER_CHECKPOINT)
 ## Punct model dùng CPU
 punct_model = PunctCapSegModelONNX.from_pretrained("1-800-BAD-CODE/xlm-roberta_punctuation_fullstop_truecase",
                                                    ort_providers=["CPUExecutionProvider"])
-
+temp = []
 class PunctProcessor:
     def __init__(self, model, number_payload=50):
         self.model = model
@@ -31,7 +32,7 @@ class PunctProcessor:
         if text.strip():
             self.buffer.append(text)
             print(text, end="\n")
-
+        temp.append(payload)
         if len(self.buffer) >= self.number_payload:
             x = " ".join(self.buffer[:self.number_payload])
             if self.unconfirmed:
