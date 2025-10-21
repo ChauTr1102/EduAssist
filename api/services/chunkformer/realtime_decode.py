@@ -1,6 +1,5 @@
 # Cài đặt các thư viện cần thiết:
 # pip install torch torchaudio sounddevice numpy pyyaml onnxruntime onnxruntime-gpu punctuators
-
 import os
 import math
 import argparse
@@ -316,7 +315,7 @@ if __name__ == "__main__":
         "--left_context_size", "128",
         "--right_context_size", "32",
         "--stream_chunk_sec", "0.5",
-        "--lookahead_sec", "0.2",
+        "--lookahead_sec", "0.5",
         "--stable_reserve_words", "1",
         "--no_progress_patience", "1",
         "--punc_model", "1-800-BAD-CODE/xlm-roberta_punctuation_fullstop_truecase",
