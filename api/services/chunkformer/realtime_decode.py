@@ -1,112 +1,136 @@
-# Cài đặt các thư viện cần thiết:
+# ===============================================
+# stream_mic_paper_ready_optimized.py
+# Real-time ChunkFormer ASR + Sliding-window Punctuation (+decap)
+# ===============================================
 # pip install torch torchaudio sounddevice numpy pyyaml onnxruntime-gpu punctuators colorama
 
-import os
-import math
-import argparse
-import yaml
-import re
-import sys
+import os, math, argparse, yaml, re, sys, threading, queue, contextlib
 from collections import deque
-import threading
-import queue
-import time
-import colorama
 
-# Punctuation model imports
+import numpy as np
+import torch, torchaudio
+import torchaudio.compliance.kaldi as kaldi
+import sounddevice as sd
 import onnxruntime as ort
 from punctuators.models import PunctCapSegModelONNX
+import colorama
 
-# ASR model imports
-import torch
-import numpy as np
-import sounddevice as sd
-import torchaudio
-import torchaudio.compliance.kaldi as kaldi
+# ---------- Bootstrap import path (EduAssist as Sources Root) ----------
+ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../"))
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
 
-# Giả định các file utils của ChunkFormer nằm trong thư mục 'model'
-from model.utils.init_model import init_model
-from model.utils.checkpoint import load_checkpoint
-from model.utils.file_utils import read_symbol_table
-from model.utils.ctc_utils import get_output
+from api.services.chunkformer.model.utils.init_model import init_model
+from api.services.chunkformer.model.utils.checkpoint import load_checkpoint
+from api.services.chunkformer.model.utils.file_utils import read_symbol_table
+from api.services.chunkformer.model.utils.ctc_utils import get_output
+# ----------------------------------------------------------------------
 
-# Khởi tạo colorama để tự động hỗ trợ màu trên Windows
+# ANSI
 colorama.init(autoreset=True)
+YELLOW = colorama.Fore.YELLOW
+BLUE   = colorama.Fore.BLUE
 
+# ===== token & casing utils =====
+_TOKEN_RE   = re.compile(r"\S+")
+END_SENT_RE = re.compile(r"[\.!\?…]\s*$", re.UNICODE)
 
-# ==================== Utils ====================
-def _longest_suffix_prefix_overlap(a: str, b: str, max_k: int = 32) -> int:
+def advance_pointer_by_words(full_text: str, start_idx: int, n_words: int) -> int:
+    cnt = 0
+    for m in _TOKEN_RE.finditer(full_text, start_idx):
+        cnt += 1
+        if cnt == n_words:
+            return m.end()
+    return len(full_text)
+
+def longest_suffix_prefix_overlap(a: str, b: str, max_k: int = 32) -> int:
     k = min(max_k, len(a), len(b))
     for L in range(k, 0, -1):
-        if a.endswith(b[:L]):
-            return L
+        if a.endswith(b[:L]): return L
     return 0
 
+def decap_first_token(s: str) -> str:
+    if not s: return s
+    i = s.find(" ")
+    first = s if i == -1 else s[:i]
+    rest  = "" if i == -1 else s[i+1:]
+    first = first[:1].lower() + first[1:]
+    return first if i == -1 else f"{first} {rest}"
 
-# ==================== ASR Worker Thread ====================
+# ===== ASR worker =====
 @torch.no_grad()
 def asr_worker(args, asr_model, char_dict, hypothesis_queue):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
     subsampling = asr_model.encoder.embed.subsampling_factor
-    num_layers = asr_model.encoder.num_blocks
+    num_layers  = asr_model.encoder.num_blocks
     conv_lorder = asr_model.encoder.cnn_module_kernel // 2
-    enc_steps = max(1, int(round((args.stream_chunk_sec / 0.01) / subsampling)))
-    chunk_size = enc_steps
-    left_context_size = args.left_context_size
-    right_context_size = args.right_context_size
-    att_cache = torch.zeros((num_layers, left_context_size, asr_model.encoder.attention_heads,
-                             asr_model.encoder._output_size * 2 // asr_model.encoder.attention_heads), device=device)
+    enc_steps   = max(1, int(round((args.stream_chunk_sec / 0.01) / subsampling)))
+    chunk_size  = enc_steps
+
+    left_ctx, right_ctx = args.left_context_size, args.right_context_size
+
+    att_cache = torch.zeros(
+        (num_layers, left_ctx, asr_model.encoder.attention_heads,
+         asr_model.encoder._output_size * 2 // asr_model.encoder.attention_heads),
+        device=device
+    )
     cnn_cache = torch.zeros((num_layers, asr_model.encoder._output_size, conv_lorder), device=device)
-    offset = torch.zeros(1, dtype=torch.int, device=device)
-    sr = args.mic_sr
+    offset    = torch.zeros(1, dtype=torch.int, device=device)
+
+    sr            = args.mic_sr
     block_samples = int(args.stream_chunk_sec * sr)
-    lookahead_blocks = max(0, int(math.ceil(args.lookahead_sec / args.stream_chunk_sec)))
+    lookahead_blk = max(0, int(math.ceil(args.lookahead_sec / args.stream_chunk_sec)))
 
-    q = deque()
-    full_hypothesis = ""
+    q_audio  = deque(maxlen=1 + lookahead_blk)
+    full_hyp = ""
+    last_sent = ""
 
-    print("ASR worker started (new architecture). Listening...")
+    print("ASR worker started. Listening...")
     try:
         with sd.InputStream(samplerate=sr, channels=1, dtype="float32", blocksize=block_samples) as stream:
             while not args.stop_event.is_set():
                 audio_block, _ = stream.read(block_samples)
-                q.append(np.squeeze(audio_block, axis=1).astype(np.float32))
+                q_audio.append(np.squeeze(audio_block, axis=1).astype(np.float32, copy=True))
 
-                if len(q) < 1 + lookahead_blocks: continue
-
-                seg_np = np.concatenate(list(q))
-                seg = torch.from_numpy(seg_np).unsqueeze(0).to(device) * (1 << 15)
-
-                if seg.size(1) < int(0.025 * sr):
-                    q.popleft()
+                if len(q_audio) < 1 + lookahead_blk:
                     continue
 
-                x = kaldi.fbank(seg, num_mel_bins=80, frame_length=25, frame_shift=10, dither=0.0, energy_floor=0.0,
-                                sample_frequency=16000).unsqueeze(0).to(device)
+                seg_np = np.concatenate(q_audio, dtype=np.float32)
+                seg = torch.from_numpy(seg_np).unsqueeze(0).to(device) * 32768.0
+                if seg.size(1) < int(0.025 * sr):  # bảo vệ fbank
+                    continue
+
+                x = kaldi.fbank(
+                    seg, num_mel_bins=80, frame_length=25, frame_shift=10,
+                    dither=0.0, energy_floor=0.0, sample_frequency=sr
+                ).unsqueeze(0).to(device)
                 x_len = torch.tensor([x.size(1)], dtype=torch.int, device=device)
 
-                with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
+                use_cuda = device.type == "cuda"
+                ctx = torch.amp.autocast(device_type='cuda', dtype=torch.float16) if use_cuda else contextlib.nullcontext()
+                with ctx:
                     enc_out, enc_len, _, att_cache, cnn_cache, offset = asr_model.encoder.forward_parallel_chunk(
                         xs=x, xs_origin_lens=x_len, chunk_size=chunk_size,
-                        left_context_size=left_context_size, right_context_size=right_context_size,
+                        left_context_size=left_ctx, right_context_size=right_ctx,
                         att_cache=att_cache, cnn_cache=cnn_cache,
                         truncated_context_size=chunk_size, offset=offset
                     )
-                    enc_out = enc_out.reshape(1, -1, enc_out.size(-1))[:, :enc_len]
-                    if enc_out.size(1) > chunk_size: enc_out = enc_out[:, :chunk_size]
-                    offset = offset - enc_len + enc_out.size(1)
+                    T = int(enc_len.item())
+                    enc_out = enc_out.reshape(1, -1, enc_out.size(-1))[:, :T]
+                    if enc_out.size(1) > chunk_size:
+                        enc_out = enc_out[:, :chunk_size]
+                    offset = offset - T + enc_out.size(1)
                     hyp_step = asr_model.encoder.ctc_forward(enc_out).squeeze(0).cpu()
 
-                current_chunk_text = get_output([hyp_step], char_dict)[0]
-                overlap = _longest_suffix_prefix_overlap(full_hypothesis, current_chunk_text)
+                chunk_text = get_output([hyp_step], char_dict)[0]
+                ovl = longest_suffix_prefix_overlap(full_hyp, chunk_text)
+                if ovl < len(chunk_text):
+                    full_hyp += chunk_text[ovl:]
 
-                # CHỈ GỬI ĐI PHẦN VĂN BẢN MỚI
-                new_text = current_chunk_text[overlap:]
-                if new_text:
-                    full_hypothesis += new_text
-                    hypothesis_queue.put(new_text)
-
-                q.popleft()
+                if full_hyp != last_sent:
+                    hypothesis_queue.put(full_hyp)
+                    last_sent = full_hyp
 
     except Exception as e:
         print(f"\nError in ASR worker: {e}")
@@ -114,174 +138,175 @@ def asr_worker(args, asr_model, char_dict, hypothesis_queue):
         hypothesis_queue.put(None)
         print("ASR worker finished.")
 
-
-# ==================== Model init ====================
+# ===== model init =====
 @torch.no_grad()
 def init_asr_model(args):
     torch.set_float32_matmul_precision("high")
     torch.backends.cudnn.benchmark = True
-    config_path = os.path.join(args.model_checkpoint, "config.yaml")
-    checkpoint_path = os.path.join(args.model_checkpoint, "pytorch_model.bin")
-    symbol_table_path = os.path.join(args.model_checkpoint, "vocab.txt")
-    with open(config_path, 'r') as fin: config = yaml.load(fin, Loader=yaml.FullLoader)
-    model = init_model(config, config_path)
-    model.eval()
-    load_checkpoint(model, checkpoint_path)
-    model.encoder = model.encoder.cuda()
-    model.ctc = model.ctc.cuda()
-    symbol_table = read_symbol_table(symbol_table_path)
-    char_dict = {v: k for k, v in symbol_table.items()}
-    return model, char_dict
+    torch.set_num_threads(max(1, args.cpu_threads))
 
+    cfg = os.path.join(args.model_checkpoint, "config.yaml")
+    ckpt = os.path.join(args.model_checkpoint, "pytorch_model.bin")
+    vocab= os.path.join(args.model_checkpoint, "vocab.txt")
+
+    with open(cfg, "r") as fin:
+        config = yaml.load(fin, Loader=yaml.FullLoader)
+
+    model = init_model(config, cfg)
+    model.eval()
+    load_checkpoint(model, ckpt)
+    if torch.cuda.is_available():
+        model.encoder = model.encoder.cuda()
+        model.ctc     = model.ctc.cuda()
+
+    symtab = read_symbol_table(vocab)
+    char_dict = {v: k for k, v in symtab.items()}
+    return model, char_dict
 
 def init_punctuation_model(args):
     print(f"Loading punctuation model: {args.punc_model}")
     m = PunctCapSegModelONNX.from_pretrained(args.punc_model)
-    available_providers = ort.get_available_providers()
-    if args.punc_device == "cuda" and "CUDAExecutionProvider" in available_providers:
+
+    prov = ["CPUExecutionProvider"]
+    if args.punc_device == "cuda" and "CUDAExecutionProvider" in ort.get_available_providers():
         prov = ["CUDAExecutionProvider", "CPUExecutionProvider"]
-        print("Punctuation model will run on CUDA.")
-    else:
-        prov = ["CPUExecutionProvider"]
-        if args.punc_device == "cuda":
-            print("Warning: CUDAExecutionProvider not found. Punctuation model will run on CPU.")
-        else:
-            print("Punctuation model will run on CPU.")
+
     for name in dir(m):
         obj = getattr(m, name)
-        if isinstance(obj, ort.InferenceSession): obj.set_providers(prov)
-    print("Punctuation model loaded.")
+        if isinstance(obj, ort.InferenceSession):
+            so = obj.get_session_options()
+            so.intra_op_num_threads = 1
+            so.inter_op_num_threads = 1
+            obj.set_providers(prov, [{"arena_extend_strategy": "kNextPowerOfTwo"}])
+
+    print("Punctuation model ready on", "CUDA" if prov[0].startswith("CUDA") else "CPU")
     return m
 
-
-# ==================== Main Thread: Punctuation and Display ====================
+# ===== main =====
 def main():
-    parser = argparse.ArgumentParser(description="Real-time ASR with True Sliding Window Processing")
+    parser = argparse.ArgumentParser(description="Real-time ASR with sliding-window punctuation (optimized + decap)")
+    ap = parser.add_argument_group("ASR")
+    ap.add_argument("--model_checkpoint", type=str, required=True)
+    ap.add_argument("--mic_sr", type=int, default=16000)
+    ap.add_argument("--stream_chunk_sec", type=float, default=0.5)
+    ap.add_argument("--lookahead_sec", type=float, default=0.5)
+    ap.add_argument("--left_context_size", type=int, default=128)
+    ap.add_argument("--right_context_size", type=int, default=32)
+    ap.add_argument("--cpu_threads", type=int, default=1)
 
-    asr_parser = parser.add_argument_group("ASR Model & Streaming Parameters")
-    # ... (giữ nguyên các parser.add_argument)
-    asr_parser.add_argument("--model_checkpoint", type=str, required=True)
-    asr_parser.add_argument("--mic_sr", type=int, default=16000)
-    asr_parser.add_argument("--stream_chunk_sec", type=float, default=0.5)
-    asr_parser.add_argument("--lookahead_sec", type=float, default=0.5)
-    asr_parser.add_argument("--chunk_size", type=int, default=64)
-    asr_parser.add_argument("--left_context_size", type=int, default=128)
-    asr_parser.add_argument("--right_context_size", type=int, default=32)
-
-    punc_parser = parser.add_argument_group("Streaming Punctuation Parameters")
-    punc_parser.add_argument("--punc_model", type=str,
-                             default="1-800-BAD-CODE/xlm-roberta_punctuation_fullstop_truecase")
-    punc_parser.add_argument("--punc_device", type=str, default="cuda", choices=["cuda", "cpu"])
-    punc_parser.add_argument("--use_sbd", action="store_true")
-    punc_parser.add_argument("--punc_window_words", type=int, default=20)
-    punc_parser.add_argument("--punc_commit_margin_words", type=int, default=8)
+    pp = parser.add_argument_group("Punctuation")
+    pp.add_argument("--punc_model", type=str,
+                    default="1-800-BAD-CODE/xlm-roberta_punctuation_fullstop_truecase")
+    pp.add_argument("--punc_device", type=str, default="cuda", choices=["cuda","cpu"])
+    pp.add_argument("--use_sbd", action="store_true")
+    pp.add_argument("--punc_window_words", type=int, default=24)
+    pp.add_argument("--punc_commit_margin_words", type=int, default=8)
+    pp.add_argument("--punc_processing_window_words", type=int, default=40)
+    pp.add_argument("--disable_truecase", action="store_true",
+                    help="Nếu bật, hạ lowercase toàn bộ output punctuation window.")
 
     args = parser.parse_args()
     args.stop_event = threading.Event()
 
-    YELLOW = colorama.Fore.YELLOW
-    BLUE = colorama.Fore.BLUE
-    RESET = colorama.Style.RESET_ALL
-
     asr_model, char_dict = init_asr_model(args)
-    punctuation_model = init_punctuation_model(args)
-    hypothesis_queue = queue.Queue()
+    punc_model = init_punctuation_model(args)
+    hyp_q = queue.Queue(maxsize=8)
 
-    asr_thread = threading.Thread(target=asr_worker, args=(args, asr_model, char_dict, hypothesis_queue))
-    asr_thread.start()
+    t = threading.Thread(target=asr_worker, args=(args, asr_model, char_dict, hyp_q), daemon=True)
+    t.start()
 
-    # THAY ĐỔI LỚN: Quản lý state theo logic mới
-    final_punctuated_text = ""
-    active_raw_buffer = ""  # Buffer thô cho vùng active
-    last_displayed_text = ""
+    committed_text = ""
+    raw_text = ""
+    committed_ptr = 0
+    last_render = ""
 
-    print("\nMic streaming. Nhấn Ctrl+C để dừng.")
+    print("\nMic streaming. Ctrl+C to stop.")
     try:
         while True:
-            # Lấy các chunk text MỚI từ ASR worker
-            new_text_chunk = None
             try:
-                # Lấy item mới nhất, không block
-                new_text_chunk = hypothesis_queue.get_nowait()
+                item = hyp_q.get(timeout=0.1)
+                if item is None:
+                    args.stop_event.set()
+                    break
+                latest = item
             except queue.Empty:
-                time.sleep(0.05)
                 continue
 
-            if new_text_chunk is None:
-                args.stop_event.set()
-                break
+            if latest == raw_text:
+                continue
+            raw_text = latest
 
-            # Nối chunk mới vào buffer
-            active_raw_buffer += new_text_chunk
-
-            # THAY ĐỔI LỚN: Model chỉ xử lý trên buffer active, không xử lý toàn bộ transcript
-            if not active_raw_buffer.strip():
+            tail_raw = raw_text[committed_ptr:]
+            if not tail_raw.strip():
                 continue
 
-            punctuated_active_buffer = punctuation_model.infer([active_raw_buffer], apply_sbd=args.use_sbd)[0]
+            tokens_tail = _TOKEN_RE.findall(tail_raw)
+            if not tokens_tail:
+                continue
+            N = args.punc_processing_window_words
+            window_tokens = tokens_tail[-N:]
+            processing_window_raw = " ".join(window_tokens)
 
-            words_in_buffer = punctuated_active_buffer.split()
+            punct_window = punc_model.infer([processing_window_raw], apply_sbd=args.use_sbd)[0]
+            if args.disable_truecase:
+                punct_window = punct_window.lower()
+            punct_tokens = _TOKEN_RE.findall(punct_window)
 
-            # Logic chốt và cắt buffer
-            if len(words_in_buffer) > args.punc_window_words:
-                commit_point_words = len(words_in_buffer) - args.punc_commit_margin_words
-
-                # Phần văn bản đã thêm dấu câu để chốt
-                text_to_commit = " ".join(words_in_buffer[:commit_point_words]) + " "
-                final_punctuated_text += text_to_commit
-
-                # Phần buffer đã thêm dấu câu còn lại để hiển thị
-                punctuated_active_buffer = " ".join(words_in_buffer[commit_point_words:])
-
-                # Cắt bớt buffer thô tương ứng
-                # Ước tính số từ thô tương ứng với số từ đã chốt
-                raw_words = active_raw_buffer.split()
-                # Đây là một cách ước lượng, có thể cải tiến thêm nếu cần độ chính xác tuyệt đối
-                if len(raw_words) > commit_point_words:
-                    active_raw_buffer = " ".join(raw_words[commit_point_words - 2:])  # Giữ lại 2 từ làm ngữ cảnh
-
-            # Logic tô màu hiển thị (giữ nguyên)
-            active_words = punctuated_active_buffer.split()
-            num_active_words = len(active_words)
-
-            blue_text, yellow_text = "", ""
-            if num_active_words > args.punc_commit_margin_words:
-                margin_point = num_active_words - args.punc_commit_margin_words
-                blue_text = " ".join(active_words[:margin_point])
-                yellow_text = " ".join(active_words[margin_point:])
+            if len(punct_tokens) > args.punc_window_words:
+                commit_k = len(punct_tokens) - args.punc_commit_margin_words
+                commit_text = " ".join(punct_tokens[:commit_k]) + " "
+                committed_text += commit_text
+                active_tokens = punct_tokens[commit_k:]
+                active_text = " ".join(active_tokens)
+                committed_ptr = advance_pointer_by_words(raw_text, committed_ptr, commit_k)
             else:
-                yellow_text = " ".join(active_words)
+                active_text = " ".join(punct_tokens)
 
-            colored_parts = []
-            if blue_text: colored_parts.append(f"{BLUE}{blue_text}")
-            if yellow_text: colored_parts.append(f"{YELLOW}{yellow_text}")
+            # decap nếu trước đó chưa kết thúc câu
+            if active_text and not END_SENT_RE.search(committed_text):
+                active_text = decap_first_token(active_text)
 
-            display_text = f"\r{final_punctuated_text}{' '.join(colored_parts)}{RESET} "
+            active_words = _TOKEN_RE.findall(active_text)
+            if len(active_words) > args.punc_commit_margin_words:
+                head = " ".join(active_words[:-args.punc_commit_margin_words])
+                tail = " ".join(active_words[-args.punc_commit_margin_words:])
+                display = f"\r{committed_text}{BLUE}{head} {YELLOW}{tail} "
+            else:
+                display = f"\r{committed_text}{YELLOW}{' '.join(active_words)} "
 
-            if display_text != last_displayed_text:
-                print(display_text.ljust(100), end="", flush=True)
-                last_displayed_text = display_text
+            if display != last_render:
+                print(display.ljust(120), end="", flush=True)
+                last_render = display
 
     except KeyboardInterrupt:
-        print("\nĐang dừng...")
+        print("\nStopping...")
         args.stop_event.set()
     finally:
-        asr_thread.join()
-        if active_raw_buffer.strip():
-            final_punctuated_text += punctuation_model.infer([active_raw_buffer])[0]
-        print(f"\r{final_punctuated_text.strip()} ")
-        print("\nHoàn tất.")
+        t.join()
+        tail_raw = raw_text[committed_ptr:]
+        if tail_raw.strip():
+            final_piece = punc_model.infer([tail_raw])[0]
+            if args.disable_truecase:
+                final_piece = final_piece.lower()
+            committed_text += final_piece
+        print(f"\r{committed_text.strip()} ")
+        print("\nDone.")
 
-
+# ===== entry =====
 if __name__ == "__main__":
-    sys.argv = [
-        "stream_mic_optimized.py",
-        "--model_checkpoint", "/home/trinhchau/code/EduAssist/api/services/chunkformer-large-vie",
-        "--stream_chunk_sec", "0.5",
-        "--lookahead_sec", "0.5",
-        "--punc_window_words", "60",
-        "--punc_commit_margin_words", "20",
-        "--punc_device", "cuda",
-    ]
-
+    if len(sys.argv) == 1:
+        sys.argv = [
+            "stream_mic_paper_ready_optimized.py",
+            "--model_checkpoint", "/home/trinhchau/code/EduAssist/api/services/chunkformer-large-vie",
+            "--stream_chunk_sec", "0.5",
+            "--lookahead_sec", "0.5",
+            "--left_context_size", "128",
+            "--right_context_size", "32",
+            "--punc_window_words", "24",
+            "--punc_commit_margin_words", "8",
+            "--punc_processing_window_words", "40",
+            "--punc_device", "cuda",
+            "--cpu_threads", "1",
+            # "--disable_truecase",    # mở nếu cần tắt truecasing
+        ]
     main()
