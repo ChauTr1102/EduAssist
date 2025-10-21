@@ -218,3 +218,12 @@ audio_output
 /api/services/hehe.py
 
 /api/private_config.py
+/api/services/chunkformer/chunkformer-large-vie/.gitattributes
+/api/services/chunkformer/chunkformer-large-vie/.gitignore
+/api/services/chunkformer/chunkformer-large-vie/config.yaml
+/api/services/chunkformer/chunkformer-large-vie/dataset.tsv
+/api/services/chunkformer/chunkformer-large-vie/global_cmvn
+/api/services/chunkformer/chunkformer-large-vie/paper.pdf
+/api/services/chunkformer/chunkformer-large-vie/pytorch_model.bin
+/api/services/chunkformer/chunkformer-large-vie/README.md
+/api/services/chunkformer/chunkformer-large-vie/vocab.txt
