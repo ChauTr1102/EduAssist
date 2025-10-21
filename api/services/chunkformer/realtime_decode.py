@@ -1,5 +1,5 @@
 # Cài đặt các thư viện cần thiết:
-# pip install torch torchaudio sounddevice numpy pyyaml onnxruntime-gpu punctuators
+# pip install torch torchaudio sounddevice numpy pyyaml onnxruntime-gpu punctuators colorama
 
 import os
 import math
@@ -11,6 +11,7 @@ from collections import deque
 import threading
 import queue
 import time
+import colorama
 
 # Punctuation model imports
 import onnxruntime as ort
@@ -29,6 +30,9 @@ from model.utils.checkpoint import load_checkpoint
 from model.utils.file_utils import read_symbol_table
 from model.utils.ctc_utils import get_output
 
+# Khởi tạo colorama để tự động hỗ trợ màu trên Windows
+colorama.init(autoreset=True)
+
 
 # ==================== Utils ====================
 def _longest_suffix_prefix_overlap(a: str, b: str, max_k: int = 32) -> int:
@@ -39,7 +43,7 @@ def _longest_suffix_prefix_overlap(a: str, b: str, max_k: int = 32) -> int:
     return 0
 
 
-# ==================== ASR Worker Thread (Kiến trúc mới) ====================
+# ==================== ASR Worker Thread ====================
 @torch.no_grad()
 def asr_worker(args, asr_model, char_dict, hypothesis_queue):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -70,7 +74,6 @@ def asr_worker(args, asr_model, char_dict, hypothesis_queue):
 
                 if len(q) < 1 + lookahead_blocks: continue
 
-                # NỐI CHUỖI CÁC BLOCK TRONG HÀNG ĐỢI THAY VÌ CHỈ 1 BLOCK
                 seg_np = np.concatenate(list(q))
                 seg = torch.from_numpy(seg_np).unsqueeze(0).to(device) * (1 << 15)
 
@@ -96,9 +99,13 @@ def asr_worker(args, asr_model, char_dict, hypothesis_queue):
 
                 current_chunk_text = get_output([hyp_step], char_dict)[0]
                 overlap = _longest_suffix_prefix_overlap(full_hypothesis, current_chunk_text)
-                full_hypothesis += current_chunk_text[overlap:]
 
-                hypothesis_queue.put(full_hypothesis)
+                # CHỈ GỬI ĐI PHẦN VĂN BẢN MỚI
+                new_text = current_chunk_text[overlap:]
+                if new_text:
+                    full_hypothesis += new_text
+                    hypothesis_queue.put(new_text)
+
                 q.popleft()
 
     except Exception as e:
@@ -109,7 +116,6 @@ def asr_worker(args, asr_model, char_dict, hypothesis_queue):
 
 
 # ==================== Model init ====================
-# (Không thay đổi)
 @torch.no_grad()
 def init_asr_model(args):
     torch.set_float32_matmul_precision("high")
@@ -150,35 +156,32 @@ def init_punctuation_model(args):
 
 # ==================== Main Thread: Punctuation and Display ====================
 def main():
-    parser = argparse.ArgumentParser(description="Real-time ASR with new robust streaming architecture")
+    parser = argparse.ArgumentParser(description="Real-time ASR with True Sliding Window Processing")
 
-    # SỬA LỖI: THÊM LẠI TOÀN BỘ PHẦN ĐỊNH NGHĨA THAM SỐ
-    # --- Tham số cho model ASR ---
     asr_parser = parser.add_argument_group("ASR Model & Streaming Parameters")
-    asr_parser.add_argument("--model_checkpoint", type=str, required=True, help="Path to ASR model directory")
+    # ... (giữ nguyên các parser.add_argument)
+    asr_parser.add_argument("--model_checkpoint", type=str, required=True)
     asr_parser.add_argument("--mic_sr", type=int, default=16000)
     asr_parser.add_argument("--stream_chunk_sec", type=float, default=0.5)
     asr_parser.add_argument("--lookahead_sec", type=float, default=0.5)
-    asr_parser.add_argument("--chunk_size", type=int, default=64,
-                            help="Internal chunk size for the model, not for audio.")
+    asr_parser.add_argument("--chunk_size", type=int, default=64)
     asr_parser.add_argument("--left_context_size", type=int, default=128)
     asr_parser.add_argument("--right_context_size", type=int, default=32)
 
-    # --- Tham số cho Punctuation ---
     punc_parser = parser.add_argument_group("Streaming Punctuation Parameters")
     punc_parser.add_argument("--punc_model", type=str,
                              default="1-800-BAD-CODE/xlm-roberta_punctuation_fullstop_truecase")
     punc_parser.add_argument("--punc_device", type=str, default="cuda", choices=["cuda", "cpu"])
     punc_parser.add_argument("--use_sbd", action="store_true")
-    punc_parser.add_argument("--punc_window_words", type=int, default=120,
-                             help="Number of words in the active (yellow) window before committing.")
-    punc_parser.add_argument("--punc_commit_margin_words", type=int, default=50,
-                             help="Number of words to keep for context after a commit.")
+    punc_parser.add_argument("--punc_window_words", type=int, default=20)
+    punc_parser.add_argument("--punc_commit_margin_words", type=int, default=8)
 
     args = parser.parse_args()
     args.stop_event = threading.Event()
-    YELLOW = "\033[93m"
-    RESET = "\033[0m"
+
+    YELLOW = colorama.Fore.YELLOW
+    BLUE = colorama.Fore.BLUE
+    RESET = colorama.Style.RESET_ALL
 
     asr_model, char_dict = init_asr_model(args)
     punctuation_model = init_punctuation_model(args)
@@ -187,43 +190,76 @@ def main():
     asr_thread = threading.Thread(target=asr_worker, args=(args, asr_model, char_dict, hypothesis_queue))
     asr_thread.start()
 
+    # THAY ĐỔI LỚN: Quản lý state theo logic mới
     final_punctuated_text = ""
-    raw_transcript = ""
+    active_raw_buffer = ""  # Buffer thô cho vùng active
     last_displayed_text = ""
 
     print("\nMic streaming. Nhấn Ctrl+C để dừng.")
     try:
         while True:
-            latest_hypothesis = None
-            while not hypothesis_queue.empty():
-                item = hypothesis_queue.get()
-                if item is None:
-                    args.stop_event.set()
-                    break
-                latest_hypothesis = item
-            if args.stop_event.is_set(): break
-
-            if latest_hypothesis is None or latest_hypothesis == raw_transcript:
+            # Lấy các chunk text MỚI từ ASR worker
+            new_text_chunk = None
+            try:
+                # Lấy item mới nhất, không block
+                new_text_chunk = hypothesis_queue.get_nowait()
+            except queue.Empty:
                 time.sleep(0.05)
                 continue
 
-            raw_transcript = latest_hypothesis
-            punctuated_transcript = punctuation_model.infer([raw_transcript], apply_sbd=args.use_sbd)[0]
-            words = punctuated_transcript.split()
+            if new_text_chunk is None:
+                args.stop_event.set()
+                break
 
-            committed_text = ""
-            active_text = punctuated_transcript
+            # Nối chunk mới vào buffer
+            active_raw_buffer += new_text_chunk
 
-            if len(words) > args.punc_window_words:
-                commit_point = len(words) - args.punc_commit_margin_words
-                committed_text = " ".join(words[:commit_point]) + " "
-                active_text = " ".join(words[commit_point:])
+            # THAY ĐỔI LỚN: Model chỉ xử lý trên buffer active, không xử lý toàn bộ transcript
+            if not active_raw_buffer.strip():
+                continue
 
-            final_punctuated_text = committed_text
+            punctuated_active_buffer = punctuation_model.infer([active_raw_buffer], apply_sbd=args.use_sbd)[0]
 
-            display_text = f"\r{final_punctuated_text}{YELLOW}{active_text}{RESET} "
+            words_in_buffer = punctuated_active_buffer.split()
+
+            # Logic chốt và cắt buffer
+            if len(words_in_buffer) > args.punc_window_words:
+                commit_point_words = len(words_in_buffer) - args.punc_commit_margin_words
+
+                # Phần văn bản đã thêm dấu câu để chốt
+                text_to_commit = " ".join(words_in_buffer[:commit_point_words]) + " "
+                final_punctuated_text += text_to_commit
+
+                # Phần buffer đã thêm dấu câu còn lại để hiển thị
+                punctuated_active_buffer = " ".join(words_in_buffer[commit_point_words:])
+
+                # Cắt bớt buffer thô tương ứng
+                # Ước tính số từ thô tương ứng với số từ đã chốt
+                raw_words = active_raw_buffer.split()
+                # Đây là một cách ước lượng, có thể cải tiến thêm nếu cần độ chính xác tuyệt đối
+                if len(raw_words) > commit_point_words:
+                    active_raw_buffer = " ".join(raw_words[commit_point_words - 2:])  # Giữ lại 2 từ làm ngữ cảnh
+
+            # Logic tô màu hiển thị (giữ nguyên)
+            active_words = punctuated_active_buffer.split()
+            num_active_words = len(active_words)
+
+            blue_text, yellow_text = "", ""
+            if num_active_words > args.punc_commit_margin_words:
+                margin_point = num_active_words - args.punc_commit_margin_words
+                blue_text = " ".join(active_words[:margin_point])
+                yellow_text = " ".join(active_words[margin_point:])
+            else:
+                yellow_text = " ".join(active_words)
+
+            colored_parts = []
+            if blue_text: colored_parts.append(f"{BLUE}{blue_text}")
+            if yellow_text: colored_parts.append(f"{YELLOW}{yellow_text}")
+
+            display_text = f"\r{final_punctuated_text}{' '.join(colored_parts)}{RESET} "
+
             if display_text != last_displayed_text:
-                print(display_text.ljust(100), end="", flush=True)  # Dùng ljust để xóa dòng cũ
+                print(display_text.ljust(100), end="", flush=True)
                 last_displayed_text = display_text
 
     except KeyboardInterrupt:
@@ -231,46 +267,21 @@ def main():
         args.stop_event.set()
     finally:
         asr_thread.join()
-        final_text = punctuation_model.infer([raw_transcript], apply_sbd=args.use_sbd)[0]
-        print(f"\r{final_text.strip()} ")
+        if active_raw_buffer.strip():
+            final_punctuated_text += punctuation_model.infer([active_raw_buffer])[0]
+        print(f"\r{final_punctuated_text.strip()} ")
         print("\nHoàn tất.")
 
 
 if __name__ == "__main__":
-    """
-    Đây là khối cấu hình để chạy script trực tiếp, mô phỏng việc gõ lệnh từ terminal.
-    Bạn có thể bỏ comment và thay đổi các giá trị dưới đây để thử nghiệm.
-    Các tham số được chia thành 2 nhóm: ASR & Streaming và Punctuation & Display.
-    """
     sys.argv = [
-        "stream_mic_new_arch.py",
-
-
-        # --- ASR & STREAMING ---
+        "stream_mic_optimized.py",
         "--model_checkpoint", "/home/trinhchau/code/EduAssist/api/services/chunkformer-large-vie",
-        "--mic_sr", "16000",
         "--stream_chunk_sec", "0.5",
         "--lookahead_sec", "0.5",
-        "--chunk_size", "64",
-        "--left_context_size", "128",
-        "--right_context_size", "32",
-
-        # --- PUNCTUATION & DISPLAY ---
-        "--punc_model", "1-800-BAD-CODE/xlm-roberta_punctuation_fullstop_truecase",
+        "--punc_window_words", "60",
+        "--punc_commit_margin_words", "20",
         "--punc_device", "cuda",
-
-        # Tổng số từ tối đa trong vùng "đang xử lý" (màu vàng).
-        # Khi văn bản dài hơn ngưỡng này, phần đầu sẽ được "chốt" (chuyển sang màu trắng).
-        # Giá trị lớn hơn (ví dụ: 30) sẽ giữ lại nhiều văn bản hơn để sửa đổi.
-        "--punc_window_words", "24",
-
-        # Số từ được giữ lại trong vùng màu vàng sau khi chốt để làm ngữ cảnh.
-        # Giá trị này nên bằng khoảng 1/3 đến 1/2 của punc_window_words.
-        "--punc_commit_margin_words", "8",
-
-        # Bật tính năng tự động ngắt câu (Sentence Boundary Detection) của model dấu câu.
-        # Để bật, hãy bỏ comment dòng dưới đây.
-        # "--use_sbd",
     ]
 
     main()
