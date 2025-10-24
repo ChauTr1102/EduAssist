@@ -49,6 +49,14 @@ def _longest_suffix_prefix_overlap(a: str, b: str, max_k: int = 32) -> int:
             return L
     return 0
 
+def longest_suffix_prefix_overlap(a: str, b: str, max_k: int = 32) -> int:
+    """Độ dài lớn nhất L để a.endswith(b[:L]) với L<=max_k."""
+    k = min(max_k, len(a), len(b))
+    for L in range(k, 0, -1):
+        if a.endswith(b[:L]):
+            return L
+    return 0
+
 _WORD_BOUNDARY_RE = re.compile(r"[ \t\n\r\f\v.,!?;:…，。！？；：]")
 
 def _split_commit_tail(text: str, reserve_last_k_words: int = 1):
@@ -116,46 +124,6 @@ def _compute_rel_right_context_frames(chunk_size_enc, right_context_size, conv_l
     rrel_enc = r_enc + max(chunk_size_enc, r_enc) * (num_layers - 1)
     return rrel_enc * subsampling  # đổi sang số frame 10ms trước subsampling
 
-
-class GPUMel80:
-    def __init__(self, device, sr=16000):
-        self.device = device
-        self.sr = sr
-        self.mel = torchaudio.transforms.MelSpectrogram(
-            sample_rate=sr,
-            n_fft=400, win_length=400, hop_length=160,
-            f_min=0.0, f_max=8000.0,
-            n_mels=80, power=2.0,
-            mel_scale="htk", norm=None, center=True,
-        ).to(device)
-
-    @torch.no_grad()
-    def __call__(self, wav_1xT: torch.Tensor) -> torch.Tensor:
-        mel = self.mel(wav_1xT.to(self.device))
-        mel = torch.clamp(mel, min=1e-10).log().transpose(1, 2).contiguous()
-        return mel  # (1, Tm, 80)
-
-def _kaldi_fbank_cpu(wav_1xT: torch.Tensor) -> torch.Tensor:
-    return kaldi.fbank(
-        wav_1xT.cpu(),
-        num_mel_bins=80, frame_length=25, frame_shift=10,
-        dither=0.0, energy_floor=0.0, sample_frequency=16000
-    ).unsqueeze(0)  # (1, T, 80)
-# ==================== Single-line writer ====================
-
-class _LineWriter:
-    def __init__(self):
-        self.prev_len = 0
-    def write(self, s: str):
-        s = s.replace("\n", " ")
-        sys.stdout.write("\r" + s)
-        # xóa phần thừa nếu ngắn hơn lần trước
-        extra = self.prev_len - len(s)
-        if extra > 0:
-            sys.stdout.write(" " * extra)
-            sys.stdout.write("\r" + s)
-        sys.stdout.flush()
-        self.prev_len = len(s)
 
 # ==================== Model init ====================
 class ChunkFormer:
@@ -460,3 +428,149 @@ class ChunkFormer:
                 _emit("final_flush", carry_text.strip())
 
         return " ".join(transcript_parts).strip()
+
+    @torch.no_grad()
+    def chunkformer_asr_realtime(self, mic_sr: int = 16000, stream_chunk_sec: float = 0.5
+                                , lookahead_sec: float = 0.5, left_context_size: int = 128, right_context_size: int = 32
+                                , max_overlap_match: int = 32, on_update=None, return_final: bool = True):
+        """
+        Realtime ASR từ microphone cho đến khi Ctrl+C.
+        Giữ logic: fbank -> forward_parallel_chunk -> CTC -> ghép overlap (suffix-prefix).
+        Output: emit theo chuẩn stream_mic qua on_update(event, payload, full).
+
+        Event:
+          - "commit": có đoạn text mới ổn định
+          - "final_flush": flush phần còn lại khi kết thúc
+        Payload: {"start": <ms>, "end": <ms>, "text": <str>}
+        """
+
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        def _emit(event_type: str, payload, full_text: str):
+            if on_update is not None:
+                on_update(event_type, payload, full_text)
+
+        # --- encoder params ---
+        subsampling = self.model.encoder.embed.subsampling_factor
+        num_layers = self.model.encoder.num_blocks
+        conv_lorder = self.model.encoder.cnn_module_kernel // 2
+
+        # chunk_size theo encoder steps (sau subsampling)
+        enc_steps = max(1, int(round((stream_chunk_sec / 0.01) / subsampling)))
+        chunk_size = enc_steps
+
+        # caches cho streaming
+        att_cache = torch.zeros(
+            (num_layers, left_context_size, self.model.encoder.attention_heads,
+             self.model.encoder._output_size * 2 // self.model.encoder.attention_heads),
+            device=device
+        )
+        cnn_cache = torch.zeros(
+            (num_layers, self.model.encoder._output_size, conv_lorder),
+            device=device
+        )
+        offset = torch.zeros(1, dtype=torch.int, device=device)
+
+        # audio buffer/lookahead
+        block_samples = int(stream_chunk_sec * mic_sr)
+        lookahead_blk = max(0, int(math.ceil(lookahead_sec / stream_chunk_sec)))
+        q_audio = deque(maxlen=1 + lookahead_blk)
+
+        # văn bản tích lũy
+        full_hyp = ""  # toàn bộ giả thuyết sau khi ghép
+        transcript_parts = []  # để build full khi emit
+        produced_steps = 0  # đếm số bước encoder đã sinh (ước lượng thời gian)
+
+        print("ASR (Chunkformer) is listening... Press Ctrl+C to stop.")
+        try:
+            with sd.InputStream(samplerate=mic_sr, channels=1, dtype="float32",
+                                blocksize=block_samples) as stream:
+                while True:
+                    audio_block, _ = stream.read(block_samples)
+                    # mono float32
+                    q_audio.append(np.squeeze(audio_block, axis=1).astype(np.float32, copy=True))
+
+                    # cần đủ lookahead
+                    if len(q_audio) < 1 + lookahead_blk:
+                        continue
+
+                    # ghép khối hiện tại + lookahead cố định
+                    seg_np = np.concatenate(q_audio, dtype=np.float32)
+                    if seg_np.size < int(0.025 * mic_sr):
+                        continue
+
+                    # fbank
+                    seg = torch.from_numpy(seg_np).unsqueeze(0).to(device) * 32768.0
+                    x = kaldi.fbank(
+                        seg, num_mel_bins=80, frame_length=25, frame_shift=10,
+                        dither=0.0, energy_floor=0.0, sample_frequency=mic_sr
+                    ).unsqueeze(0).to(device)
+                    x_len = torch.tensor([x.size(1)], dtype=torch.int, device=device)
+
+                    # forward streaming
+                    with torch.cuda.amp.autocast(dtype=torch.float16):
+                        enc_out, enc_len, _, att_cache, cnn_cache, offset = self.model.encoder.forward_parallel_chunk(
+                            xs=x,
+                            xs_origin_lens=x_len,
+                            chunk_size=chunk_size,
+                            left_context_size=left_context_size,
+                            right_context_size=right_context_size,
+                            att_cache=att_cache,
+                            cnn_cache=cnn_cache,
+                            truncated_context_size=chunk_size,
+                            offset=offset
+                        )
+
+                        T = int(enc_len.item())
+                        enc_out = enc_out.reshape(1, -1, enc_out.size(-1))[:, :T]
+                        if enc_out.size(1) > chunk_size:
+                            enc_out = enc_out[:, :chunk_size]
+                        offset = offset - T + enc_out.size(1)
+
+                        # logits -> greedy CTC
+                        hyp_step = self.model.encoder.ctc_forward(enc_out).squeeze(0).cpu()
+
+                    # ước lượng mốc thời gian cho đoạn step này (ms)
+                    seg_start_ms = int(produced_steps * subsampling * 10)
+                    seg_end_ms = int((produced_steps + hyp_step.numel()) * subsampling * 10)
+                    produced_steps += hyp_step.numel()
+
+                    # văn bản chunk hiện tại
+                    chunk_text = get_output([hyp_step], self.char_dict)[0]
+
+                    # ghép an toàn bằng suffix-prefix overlap
+                    ovl = longest_suffix_prefix_overlap(full_hyp, chunk_text, max_k=max_overlap_match)
+                    new_piece = chunk_text[ovl:] if ovl < len(chunk_text) else ""
+
+                    if new_piece.strip():
+                        # cập nhật full và emit "commit" giống stream_mic
+                        full_hyp += new_piece
+                        cleaned = new_piece.strip()
+                        transcript_parts.append(cleaned)
+                        payload = {"start": seg_start_ms, "end": seg_end_ms, "text": cleaned}
+                        _emit("commit", payload, " ".join(transcript_parts).strip())
+
+                    # trượt cửa sổ: bỏ block cũ nhất
+                    q_audio.popleft()
+                    torch.cuda.empty_cache()
+
+        except KeyboardInterrupt:
+            pass
+        finally:
+            # flush phần còn lại như stream_mic: "final_flush"
+            remaining = ""
+            if full_hyp and (not transcript_parts or " ".join(transcript_parts).strip() != full_hyp.strip()):
+                # nếu còn phần chưa đóng gói (hiếm khi xảy ra với chiến lược commit theo new_piece),
+                # ta coi phần sai khác là remaining để emit nốt
+                already = " ".join(transcript_parts).strip()
+                if len(full_hyp) > len(already):
+                    remaining = full_hyp[len(already):].strip()
+
+            if remaining:
+                transcript_parts.append(remaining)
+                payload = {"start": 0, "end": 0, "text": remaining}  # không có mốc chính xác → 0
+                _emit("final_flush", payload, " ".join(transcript_parts).strip())
+
+            if return_final:
+                return " ".join(transcript_parts).strip()
+            return ""

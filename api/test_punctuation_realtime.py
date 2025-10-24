@@ -31,7 +31,7 @@ class PunctProcessor:
 
         if text.strip():
             self.buffer.append(text)
-            print(text, end="\n")
+            # print(text, end="\n")
         temp.append(payload)
         if len(self.buffer) >= self.number_payload:
             x = " ".join(self.buffer[:self.number_payload])
@@ -49,17 +49,27 @@ class PunctProcessor:
 def just_print(event, payload, full):
     print(payload["text"], end=" ")
 
-proc = PunctProcessor(punct_model, number_payload=10)
+proc = PunctProcessor(punct_model, number_payload=30)
 
-final_text = chunkformer.stream_mic(
+final_text = chunkformer.chunkformer_asr_realtime(
+    mic_sr=16000,
     stream_chunk_sec=0.5,
-    left_context_size=128, right_context_size=32,
-    mic_sr=16000, lookahead_sec=0.5,
-    silence_rms=0.005, silence_runs=1,
-    stable_reserve_words=1,
-    max_duration_sec=None,
+    lookahead_sec=0.5,
+    left_context_size=128,
+    right_context_size=32,
+    max_overlap_match=32,
     on_update=proc.punct_process,
 )
+
+# final_text = chunkformer.stream_mic(
+#     stream_chunk_sec=0.5,
+#     left_context_size=128, right_context_size=32,
+#     mic_sr=16000, lookahead_sec=0.5,
+#     silence_rms=0.005, silence_runs=1,
+#     stable_reserve_words=1,
+#     max_duration_sec=None,
+#     on_update=just_print,
+# )
 
 # ## Dùng thread để chạy model punctuation song song với chunkformer dùng gpu
 # import threading, queue, time
