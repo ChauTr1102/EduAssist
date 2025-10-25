@@ -1,493 +1,318 @@
-# realtime_asr_punct.py
-# ASR ChunkFormer streaming + ONNX punctuation truecasing overlay (song song, nhấp-nháy)
-
-import os, re, sys, math, yaml, time, threading, queue
-import numpy as np
+import os, math, argparse, yaml, re, sys, threading, queue, contextlib
 from collections import deque
 
+import numpy as np
 import torch, torchaudio
 import torchaudio.compliance.kaldi as kaldi
+import sounddevice as sd
+import onnxruntime as ort
+from punctuators.models import PunctCapSegModelONNX
+import colorama
 
-# ====== your project imports (giữ nguyên) ======
-from model.utils.init_model import init_model
-from model.utils.checkpoint import load_checkpoint
-from model.utils.file_utils import read_symbol_table
-from model.utils.ctc_utils import get_output
-from api.private_config import CHUNKFORMER_CHECKPOINT
+# ---------- Bootstrap import path (EduAssist as Sources Root) ----------
+ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../"))
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
 
-# ====== optional punctuation ONNX ======
-try:
-    import onnxruntime as ort
-    from punctuators.models import PunctCapSegModelONNX
-    _HAS_PUNCT = True
-except Exception:
-    _HAS_PUNCT = False
+from api.services.chunkformer.model.utils.init_model import init_model
+from api.services.chunkformer.model.utils.checkpoint import load_checkpoint
+from api.services.chunkformer.model.utils.file_utils import read_symbol_table
+from api.services.chunkformer.model.utils.ctc_utils import get_output
+# ----------------------------------------------------------------------
 
-# ==================== ANSI helpers (nhấp-nháy/nhạt màu phần đuôi) ====================
-ANSI_RESET = "\033[0m"
-ANSI_DIM = "\033[2m"
-ANSI_REV = "\033[7m"
-ANSI_BLINK = "\033[5m"
+# ANSI
+colorama.init(autoreset=True)
+YELLOW = colorama.Fore.YELLOW
+BLUE   = colorama.Fore.BLUE
 
+# ===== token & regex =====
+_TOKEN_RE   = re.compile(r"\S+")
+END_SENT_RE = re.compile(r"[\.!\?…]\s*$", re.UNICODE)
 
-def _supports_ansi():
-    return sys.stdout.isatty()
+# ===== helpers =====
+def advance_pointer_by_words(full_text: str, start_idx: int, n_words: int) -> int:
+    cnt = 0
+    for m in _TOKEN_RE.finditer(full_text, start_idx):
+        cnt += 1
+        if cnt == n_words:
+            return m.end()
+    return len(full_text)
 
-
-# ==================== Text merge & stability (giữ của bạn) ====================
-_WORD_BOUNDARY_RE = re.compile(r"[ \t\n\r\f\v.,!?;:…，。！？；：]")
-
-
-def _longest_suffix_prefix_overlap(a: str, b: str, max_k: int = 64) -> int:
+def longest_suffix_prefix_overlap(a: str, b: str, max_k: int = 32) -> int:
     k = min(max_k, len(a), len(b))
     for L in range(k, 0, -1):
-        if a[-L:] == b[:L]:
-            return L
+        if a.endswith(b[:L]): return L
     return 0
 
+def decap_first_token(s: str) -> str:
+    if not s: return s
+    i = s.find(" ")
+    first = s if i == -1 else s[:i]
+    rest  = "" if i == -1 else s[i+1:]
+    first = first[:1].lower() + first[1:]
+    return first if i == -1 else f"{first} {rest}"
 
-def _longest_common_substring(a: str, b: str):
-    m, n = len(a), len(b)
-    dp = [[0] * (n + 1) for _ in range(m + 1)]
-    best = (0, 0, 0)
-    for i in range(1, m + 1):
-        ai = a[i - 1]
-        for j in range(1, n + 1):
-            if ai == b[j - 1]:
-                v = dp[i - 1][j - 1] + 1
-                dp[i][j] = v
-                if v > best[0]:
-                    best = (v, i, j)
-    return best  # length, end_a_idx, end_b_idx
-
-
-def _split_commit_tail(text: str, reserve_last_k_words: int = 1):
-    parts = re.split(r"(\s+|[.,!?;:…])", text)
-    words = []
-    buf = ""
-    for p in parts:
-        buf += p
-        if _WORD_BOUNDARY_RE.fullmatch(p or ""):
-            words.append(buf)
-            buf = ""
-    if buf:
-        words.append(buf)
-    if not words:
-        return "", text
-    if len(words) <= reserve_last_k_words:
-        return "", "".join(words)
-    return "".join(words[:-reserve_last_k_words]), "".join(words[-reserve_last_k_words:])
-
-
-def _smart_merge(prev_tail: str, cur_text: str, lcs_window=48, lcs_min=12):
-    ov = _longest_suffix_prefix_overlap(prev_tail, cur_text, max_k=lcs_window)
-    if ov >= lcs_min:
-        return prev_tail + cur_text[ov:]
-    a = prev_tail[-lcs_window:]
-    b = cur_text[:lcs_window]
-    L, _ea, eb = _longest_common_substring(a, b)
-    if L >= lcs_min:
-        return prev_tail + cur_text[eb:]
-    return prev_tail + cur_text
-
-
-def _adaptive_reserve_words(overlap_ratio: float, base=1, hard=2, thresh=0.35):
-    return hard if overlap_ratio < thresh else base
-
-
-# ==================== Feature extractors ====================
-class GPUMel80:
-    def __init__(self, device, sr=16000):
-        self.device = device
-        self.sr = sr
-        self.mel = torchaudio.transforms.MelSpectrogram(
-            sample_rate=sr,
-            n_fft=400, win_length=400, hop_length=160,
-            f_min=0.0, f_max=8000.0,
-            n_mels=80, power=2.0,
-            mel_scale="htk", norm=None, center=True,
-        ).to(device)
-
-    @torch.no_grad()
-    def __call__(self, wav_1xT: torch.Tensor) -> torch.Tensor:
-        mel = self.mel(wav_1xT.to(self.device))
-        mel = torch.clamp(mel, min=1e-10).log().transpose(1, 2).contiguous()
-        return mel  # (1, Tm, 80)
-
-
+# ===== ASR worker =====
 @torch.no_grad()
-def _kaldi_fbank_cpu(wav_1xT: torch.Tensor) -> torch.Tensor:
-    return kaldi.fbank(
-        wav_1xT.cpu(),
-        num_mel_bins=80, frame_length=25, frame_shift=10,
-        dither=0.0, energy_floor=0.0, sample_frequency=16000
-    ).unsqueeze(0)
-
-
-# ==================== Model init ====================
-@torch.no_grad()
-def init_asr(model_checkpoint):
-    torch.set_float32_matmul_precision("high")
-    torch.backends.cudnn.benchmark = True
-    try:
-        torch.backends.cuda.enable_flash_sdp(True)
-        torch.backends.cuda.enable_math_sdp(False)
-        torch.backends.cuda.enable_mem_efficient_sdp(False)
-    except Exception:
-        pass
-
-    cfg = os.path.join(model_checkpoint, "config.yaml")
-    ckpt = os.path.join(model_checkpoint, "pytorch_model.bin")
-    vocab = os.path.join(model_checkpoint, "vocab.txt")
-
-    with open(cfg, 'r') as fin:
-        config = yaml.load(fin, Loader=yaml.FullLoader)
-    model = init_model(config, cfg)
-    model.eval()
-    load_checkpoint(model, ckpt)
-
-    model.encoder = model.encoder.cuda()
-    model.ctc = model.ctc.cuda()
-
-    symbol_table = read_symbol_table(vocab)
-    char_dict = {v: k for k, v in symbol_table.items()}
-    return model, char_dict
-
-
-# ==================== Punctuation worker (song song) ====================
-class PunctWorker(threading.Thread):
-    def __init__(self,
-                 model_id="1-800-BAD-CODE/xlm-roberta_punctuation_fullstop_truecase",
-                 device="cuda", providers=("CUDAExecutionProvider", "CPUExecutionProvider"),
-                 rate_hz=6.0,
-                 reserve_words=1,
-                 apply_sbd=False,
-                 ansi_dim_tail=True,
-                 ansi_blink=False):
-        super().__init__(daemon=True)
-        self.enabled = _HAS_PUNCT
-        self.queue = queue.Queue(maxsize=1)
-        self.stop_event = threading.Event()
-        self.rate_hz = rate_hz
-        self.reserve_words = max(0, reserve_words)
-        self.apply_sbd = apply_sbd
-        self.ansi_dim_tail = ansi_dim_tail
-        self.ansi_blink = ansi_blink and _supports_ansi()
-        self._last_emit = 0.0
-        self._overlay = ""  # chuỗi đã gắn dấu để hiển thị
-        self._have_overlay = False
-
-        if self.enabled:
-            # load model
-            self.m = PunctCapSegModelONNX.from_pretrained(model_id)
-            # đặt providers ưu tiên GPU rồi CPU
-            prov = list(providers) if device == "cuda" else ["CPUExecutionProvider"]
-            for name in dir(self.m):
-                obj = getattr(self.m, name)
-                if isinstance(obj, ort.InferenceSession):
-                    try:
-                        obj.set_providers(prov)
-                    except Exception:
-                        pass
-        else:
-            self.m = None
-
-    def submit(self, raw_text: str):
-        if not self.enabled:
-            return
-
-        # drop older items in queue
-        while not self.queue.empty():
-            try:
-                self.queue.get_nowait()
-            except Exception:
-                break
-        try:
-            self.queue.put_nowait(raw_text)
-        except queue.Full:
-            pass
-
-    def get_display(self, fallback: str):
-        if self._have_overlay:
-            commit, tail = _split_commit_tail(self._overlay, self.reserve_words)
-            decorated_tail = self._decorate_tail(tail)
-            return commit, decorated_tail
-
-        commit, tail = _split_commit_tail(fallback, self.reserve_words)
-        return commit, self._decorate_tail(tail)
-
-    def _decorate_tail(self, text: str) -> str:
-        if not text or not _supports_ansi() or not self.ansi_dim_tail:
-            return text
-        return (ANSI_BLINK + text + ANSI_RESET) if self.ansi_blink else (ANSI_DIM + text + ANSI_RESET)
-
-    def run(self):
-        if not self.enabled:
-            return
-        min_interval = 1.0 / max(1e-6, self.rate_hz)
-        while not self.stop_event.is_set():
-            try:
-                raw = self.queue.get(timeout=0.1)
-            except queue.Empty:
-                continue
-            now = time.time()
-            if now - self._last_emit < min_interval:
-                time.sleep(min_interval - (now - self._last_emit))
-            self._last_emit = time.time()
-
-            # ONNX infer trên toàn bộ raw để tối đa ngữ cảnh
-            try:
-                out_list = self.m.infer([raw], apply_sbd=self.apply_sbd)
-                if isinstance(out_list, list) and out_list:
-                    pred = out_list[0]
-                    if isinstance(pred, dict) and "text" in pred:
-                        pred = pred["text"]
-                    elif not isinstance(pred, str):
-                        pred = str(pred)
-                else:
-                    pred = str(out_list)
-                self._overlay = pred
-            except Exception:
-                self._overlay = raw  # fallback
-
-            self._have_overlay = True
-
-    def stop(self):
-        self.stop_event.set()
-
-
-# ==================== Microphone streaming ====================
-@torch.no_grad()
-def stream_mic(args, model, char_dict):
-    import sounddevice as sd
-
+def asr_worker(args, asr_model, char_dict, hypothesis_queue):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    subsampling = model.encoder.embed.subsampling_factor
-    num_layers = model.encoder.num_blocks
-    conv_lorder = model.encoder.cnn_module_kernel // 2
 
-    enc_steps = max(1, int(round((args.stream_chunk_sec / 0.01) / subsampling)))
-    chunk_size = enc_steps
-    left_context_size = args.left_context_size
-    right_context_size = args.right_context_size
+    subsampling = asr_model.encoder.embed.subsampling_factor
+    num_layers  = asr_model.encoder.num_blocks
+    conv_lorder = asr_model.encoder.cnn_module_kernel // 2
+    enc_steps   = max(1, int(round((args.stream_chunk_sec / 0.01) / subsampling)))
+    chunk_size  = enc_steps
+
+    left_ctx, right_ctx = args.left_context_size, args.right_context_size
 
     att_cache = torch.zeros(
-        (num_layers, left_context_size, model.encoder.attention_heads,
-         model.encoder._output_size * 2 // model.encoder.attention_heads),
+        (num_layers, left_ctx, asr_model.encoder.attention_heads,
+         asr_model.encoder._output_size * 2 // asr_model.encoder.attention_heads),
         device=device
     )
-    cnn_cache = torch.zeros((num_layers, model.encoder._output_size, conv_lorder), device=device)
-    offset = torch.zeros(1, dtype=torch.int, device=device)
+    cnn_cache = torch.zeros((num_layers, asr_model.encoder._output_size, conv_lorder), device=device)
+    offset    = torch.zeros(1, dtype=torch.int, device=device)
 
-    sr = args.mic_sr
-    assert sr == 16000, "Mic nên 16 kHz"
-    block = int(args.stream_chunk_sec * sr)
-    look_blocks = max(0, int(math.ceil(args.lookahead_sec / args.stream_chunk_sec)))
+    sr            = args.mic_sr
+    block_samples = int(args.stream_chunk_sec * sr)
+    lookahead_blk = max(0, int(math.ceil(args.lookahead_sec / args.stream_chunk_sec)))
 
-    q = deque()
-    full_text = ""   # đã commit
-    carry_text = ""  # đuôi chưa commit
-    last_snapshot = ""
-    idle_counter = 0
+    q_audio  = deque(maxlen=1 + lookahead_blk)
+    full_hyp = ""
+    last_sent = ""
 
-    fe = GPUMel80(device, sr) if args.use_gpu_mel else None
-
-    # khởi động worker dấu câu nếu bật
-    punct = None
-    if args.enable_punct and _HAS_PUNCT:
-        punct = PunctWorker(
-            model_id=args.punct_model_id,
-            device=("cuda" if args.punct_device == "gpu" else "cpu"),
-            providers=("CUDAExecutionProvider", "CPUExecutionProvider"),
-            rate_hz=args.punct_rate_hz,
-            reserve_words=args.punct_reserve_words,
-            apply_sbd=args.punct_apply_sbd,
-            ansi_dim_tail=args.ansi_dim_tail,
-            ansi_blink=args.ansi_blink_tail
-        )
-        punct.start()
-
+    print("ASR worker started. Listening...")
     try:
-        with sd.InputStream(samplerate=sr, channels=1, dtype="float32", blocksize=block) as stream:
-            while True:
-                audio_block, _ = stream.read(block)
-                a = np.squeeze(audio_block, axis=1).astype(np.float32)
-                q.append(a)
+        with sd.InputStream(samplerate=sr, channels=1, dtype="float32", blocksize=block_samples) as stream:
+            while not args.stop_event.is_set():
+                audio_block, _ = stream.read(block_samples)
+                q_audio.append(np.squeeze(audio_block, axis=1).astype(np.float32, copy=True))
 
-                snapshot_raw = full_text + carry_text
-
-                if len(q) < 1 + look_blocks:
-                    if punct:
-                        punct.submit(snapshot_raw)
-                        commit_display, tail_display = punct.get_display(snapshot_raw)
-                    else:
-                        commit_display, tail_display = snapshot_raw, ""
-                    sys.stdout.write("\r\033[K")
-                    display_text = commit_display + tail_display if args.show_tail else commit_display
-                    sys.stdout.write(display_text.strip())
-                    sys.stdout.flush()
+                if len(q_audio) < 1 + lookahead_blk:
                     continue
 
-                seg_np = np.concatenate([q[0]] + list(list(q)[1:1 + look_blocks]))
-                seg = torch.from_numpy(seg_np).unsqueeze(0).to(device)
-                seg = seg * (1 << 15)
+                seg_np = np.concatenate(q_audio, dtype=np.float32)
+                seg = torch.from_numpy(seg_np).unsqueeze(0).to(device) * 32768.0
                 if seg.size(1) < int(0.025 * sr):
-                    q.popleft()
                     continue
 
-                x = _kaldi_fbank_cpu(seg).to(device) if fe is None else fe(seg)
+                x = kaldi.fbank(
+                    seg, num_mel_bins=80, frame_length=25, frame_shift=10,
+                    dither=0.0, energy_floor=0.0, sample_frequency=sr
+                ).unsqueeze(0).to(device)
                 x_len = torch.tensor([x.size(1)], dtype=torch.int, device=device)
 
-                with torch.amp.autocast("cuda", dtype=torch.float16):
-                    enc_out, enc_len, _, att_cache, cnn_cache, offset = model.encoder.forward_parallel_chunk(
-                        xs=x, xs_origin_lens=x_len,
-                        chunk_size=chunk_size,
-                        left_context_size=left_context_size,
-                        right_context_size=right_context_size,
+                use_cuda = device.type == "cuda"
+                ctx = torch.amp.autocast(device_type='cuda', dtype=torch.float16) if use_cuda else contextlib.nullcontext()
+                with ctx:
+                    enc_out, enc_len, _, att_cache, cnn_cache, offset = asr_model.encoder.forward_parallel_chunk(
+                        xs=x, xs_origin_lens=x_len, chunk_size=chunk_size,
+                        left_context_size=left_ctx, right_context_size=right_ctx,
                         att_cache=att_cache, cnn_cache=cnn_cache,
                         truncated_context_size=chunk_size, offset=offset
                     )
-                    enc_out = enc_out.reshape(1, -1, enc_out.size(-1))[:, :enc_len]
+                    T = int(enc_len.item())
+                    enc_out = enc_out.reshape(1, -1, enc_out.size(-1))[:, :T]
                     if enc_out.size(1) > chunk_size:
                         enc_out = enc_out[:, :chunk_size]
-                    offset = offset - enc_len + enc_out.size(1)
-                    hyp_step = model.encoder.ctc_forward(enc_out).squeeze(0).cpu()
+                    offset = offset - T + enc_out.size(1)
+                    hyp_step = asr_model.encoder.ctc_forward(enc_out).squeeze(0).cpu()
 
                 chunk_text = get_output([hyp_step], char_dict)[0]
+                ovl = longest_suffix_prefix_overlap(full_hyp, chunk_text)
+                if ovl < len(chunk_text):
+                    full_hyp += chunk_text[ovl:]
 
-                merged = _smart_merge(carry_text, chunk_text, lcs_window=args.lcs_window, lcs_min=args.lcs_min)
-                overlap_used = len(carry_text) + len(chunk_text) - len(merged)
-                overlap_ratio = 0.0 if len(chunk_text) == 0 else max(0.0,
-                                                                     min(1.0, overlap_used / max(1, len(chunk_text))))
-                reserve_words = _adaptive_reserve_words(overlap_ratio,
-                                                        base=args.stable_reserve_words,
-                                                        hard=args.stable_reserve_words + 1,
-                                                        thresh=args.adaptive_overlap_thresh)
-                commit, new_tail = _split_commit_tail(merged, reserve_last_k_words=reserve_words)
+                if full_hyp != last_sent:
+                    hypothesis_queue.put(full_hyp)
+                    last_sent = full_hyp
 
-                progressed = bool(commit) or (new_tail != last_snapshot)
-                idle_counter = 0 if progressed else (idle_counter + 1)
-                last_snapshot = new_tail
-
-                if commit:
-                    full_text += commit
-
-                do_force = False
-                if args.punct_flush and re.search(r"[.!?…。，、！？；：]\s*$", new_tail):
-                    do_force = True
-                if len(new_tail) >= args.max_tail_chars:
-                    do_force = True
-                if idle_counter >= args.idle_flush_chunks and new_tail.strip():
-                    do_force = True
-
-                if do_force and new_tail.strip():
-                    full_text += new_tail
-                    new_tail = ""
-                    idle_counter = 0
-
-                carry_text = new_tail
-
-                snapshot_raw = full_text + carry_text
-                if punct:
-                    punct.submit(snapshot_raw)
-
-                commit_display_punct, tail_display_punct = punct.get_display(snapshot_raw) if punct else (snapshot_raw, "")
-
-                # Xóa toàn bộ dòng cũ để tránh ký tự rác
-                sys.stdout.write("\r\033[K")
-
-                # In ra văn bản hoàn chỉnh
-                final_display = commit_display_punct + tail_display_punct if args.show_tail else commit_display_punct
-                sys.stdout.write(final_display.strip())
-                sys.stdout.flush()
-
-                q.popleft()
+    except Exception as e:
+        print(f"\nError in ASR worker: {e}")
     finally:
-        if punct:
-            punct.stop()
-        print("\nStreaming finished.")  # newline khi kết thúc
+        hypothesis_queue.put(None)
+        print("ASR worker finished.")
 
+# ===== model init =====
+@torch.no_grad()
+def init_asr_model(args):
+    torch.set_float32_matmul_precision("high")
+    torch.backends.cudnn.benchmark = True
+    torch.set_num_threads(max(1, args.cpu_threads))
 
-# ==================== CLI ====================
-def build_arg_parser():
-    import argparse
-    p = argparse.ArgumentParser(description="ChunkFormer streaming + realtime punctuation overlay")
-    # ASR
-    p.add_argument("--model_checkpoint", type=str, required=True)
-    p.add_argument("--left_context_size", type=int, default=16)
-    p.add_argument("--right_context_size", type=int, default=8)
-    p.add_argument("--mic", action="store_true")
-    p.add_argument("--mic_sr", type=int, default=16000)
-    p.add_argument("--stream_chunk_sec", type=float, default=0.5)
-    p.add_argument("--lookahead_sec", type=float, default=0.2)
-    # ổn định văn bản
-    p.add_argument("--stable_reserve_words", type=int, default=0)
-    p.add_argument("--adaptive_overlap_thresh", type=float, default=0.35)
-    p.add_argument("--lcs_window", type=int, default=64)
-    p.add_argument("--lcs_min", type=int, default=16)
-    p.add_argument("--idle_flush_chunks", type=int, default=1)
-    p.add_argument("--max_tail_chars", type=int, default=40)
-    p.add_argument("--punct_flush", action="store_true")
-    p.add_argument("--use_gpu_mel", action="store_true")
-    p.add_argument("--show_tail", action="store_true", default=True)
-    # punctuation worker
-    p.add_argument("--enable_punct", action="store_true")
-    p.add_argument("--punct_model_id", type=str,
-                   default="1-800-BAD-CODE/xlm-roberta_punctuation_fullstop_truecase")
-    p.add_argument("--punct_device", choices=["gpu", "cpu"], default="gpu",
-                   help="Nếu 1 GPU chung với ASR bị tranh tài nguyên, đặt cpu.")
-    p.add_argument("--punct_rate_hz", type=float, default=6.0)
-    p.add_argument("--punct_reserve_words", type=int, default=1)
-    p.add_argument("--punct_apply_sbd", action="store_true",
-                   help="Bật nếu muốn worker tự ngắt câu theo mô hình.")
-    # ANSI hiển thị
-    p.add_argument("--ansi_dim_tail", action="store_true")
-    p.add_argument("--ansi_blink_tail", action="store_true")
-    return p
+    cfg = os.path.join(args.model_checkpoint, "config.yaml")
+    ckpt = os.path.join(args.model_checkpoint, "pytorch_model.bin")
+    vocab= os.path.join(args.model_checkpoint, "vocab.txt")
 
+    with open(cfg, "r") as fin:
+        config = yaml.load(fin, Loader=yaml.FullLoader)
 
+    model = init_model(config, cfg)
+    model.eval()
+    load_checkpoint(model, ckpt)
+    if torch.cuda.is_available():
+        model.encoder = model.encoder.cuda()
+        model.ctc     = model.ctc.cuda()
+
+    symtab = read_symbol_table(vocab)
+    char_dict = {v: k for k, v in symtab.items()}
+    return model, char_dict
+
+def init_punctuation_model(args):
+    print(f"Loading punctuation model: {args.punc_model}")
+    m = PunctCapSegModelONNX.from_pretrained(args.punc_model)
+
+    prov = ["CPUExecutionProvider"]
+    if args.punc_device == "cuda" and "CUDAExecutionProvider" in ort.get_available_providers():
+        prov = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+
+    for name in dir(m):
+        obj = getattr(m, name)
+        if isinstance(obj, ort.InferenceSession):
+            so = obj.get_session_options()
+            so.intra_op_num_threads = 1
+            so.inter_op_num_threads = 1
+            obj.set_providers(prov, [{"arena_extend_strategy": "kNextPowerOfTwo"}])
+
+    print("Punctuation model ready on", "CUDA" if prov[0].startswith("CUDA") else "CPU")
+    return m
+
+# ===== main =====
 def main():
-    parser = build_arg_parser()
+    parser = argparse.ArgumentParser(description="Realtime ASR + punctuation with safe context-overlap")
+    ap = parser.add_argument_group("ASR")
+    ap.add_argument("--model_checkpoint", type=str, required=True)
+    ap.add_argument("--mic_sr", type=int, default=16000)
+    ap.add_argument("--stream_chunk_sec", type=float, default=0.5)
+    ap.add_argument("--lookahead_sec", type=float, default=0.5)
+    ap.add_argument("--left_context_size", type=int, default=128)
+    ap.add_argument("--right_context_size", type=int, default=32)
+    ap.add_argument("--cpu_threads", type=int, default=1)
+
+    pp = parser.add_argument_group("Punctuation")
+    pp.add_argument("--punc_model", type=str,
+                    default="1-800-BAD-CODE/xlm-roberta_punctuation_fullstop_truecase")
+    pp.add_argument("--punc_device", type=str, default="cuda", choices=["cuda","cpu"])
+    pp.add_argument("--use_sbd", action="store_true")
+    pp.add_argument("--punc_window_words", type=int, default=24)
+    pp.add_argument("--punc_commit_margin_words", type=int, default=8)
+    pp.add_argument("--punc_processing_window_words", type=int, default=40)
+    pp.add_argument("--punc_context_overlap_words", type=int, default=3,
+                    help="Số từ từ phần đã commit đưa vào đầu cửa sổ punctuation làm ngữ cảnh.")
+
     args = parser.parse_args()
+    args.stop_event = threading.Event()
 
-    assert getattr(args, "mic", False), "Chế độ này cần --mic"
-    model, char_dict = init_asr(args.model_checkpoint)
-    stream_mic(args, model, char_dict)
+    asr_model, char_dict = init_asr_model(args)
+    punc_model = init_punctuation_model(args)
+    hyp_q = queue.Queue(maxsize=8)
 
+    t = threading.Thread(target=asr_worker, args=(args, asr_model, char_dict, hyp_q), daemon=True)
+    t.start()
 
+    committed_text = ""
+    raw_text = ""
+    committed_ptr = 0
+    last_render = ""
+
+    print("\nMic streaming. Ctrl+C to stop.")
+    try:
+        while True:
+            try:
+                item = hyp_q.get(timeout=0.1)
+                if item is None:
+                    args.stop_event.set()
+                    break
+                latest = item
+            except queue.Empty:
+                continue
+
+            if latest == raw_text:
+                continue
+            raw_text = latest
+
+            tail_raw = raw_text[committed_ptr:]
+            if not tail_raw.strip():
+                continue
+
+            tokens_tail = _TOKEN_RE.findall(tail_raw)
+            if not tokens_tail:
+                continue
+
+            # ---- context-overlap an toàn ----
+            N = args.punc_processing_window_words
+            K_cfg = max(0, int(args.punc_context_overlap_words))
+            # K = 0 cho lần đầu (tránh cắt nhầm), sau đó dùng K_cfg
+            K = 0 if committed_ptr == 0 else K_cfg
+
+            context_tokens = _TOKEN_RE.findall(committed_text.strip())[-K:] if K > 0 and committed_text.strip() else []
+            window_tokens = context_tokens + tokens_tail[-N:]
+            processing_window_raw = " ".join(window_tokens)
+
+            punct_window = punc_model.infer([processing_window_raw], apply_sbd=args.use_sbd)[0]
+
+            # cắt bỏ đúng số token context thực sự đã ghép
+            punct_tokens_full = _TOKEN_RE.findall(punct_window)
+            actual_k = len(context_tokens)
+            if actual_k > 0 and len(punct_tokens_full) > actual_k:
+                punct_tokens = punct_tokens_full[actual_k:]
+            else:
+                punct_tokens = punct_tokens_full
+
+            # commit + active
+            if len(punct_tokens) > args.punc_window_words:
+                commit_k = len(punct_tokens) - args.punc_commit_margin_words
+                commit_text = " ".join(punct_tokens[:commit_k]) + " "
+                committed_text += commit_text
+                active_tokens = punct_tokens[commit_k:]
+                active_text = " ".join(active_tokens)
+                committed_ptr = advance_pointer_by_words(raw_text, committed_ptr, commit_k)
+            else:
+                active_text = " ".join(punct_tokens)
+
+            # fallback: nếu trước đó chưa có dấu kết câu rõ ràng, hạ chữ đầu active
+            if active_text and not END_SENT_RE.search(committed_text.strip()):
+                active_text = decap_first_token(active_text)
+
+            # render
+            active_words = _TOKEN_RE.findall(active_text)
+            if len(active_words) > args.punc_commit_margin_words:
+                head = " ".join(active_words[:-args.punc_commit_margin_words])
+                tail = " ".join(active_words[-args.punc_commit_margin_words:])
+                display = f"\r{committed_text}{BLUE}{head} {YELLOW}{tail} "
+            else:
+                display = f"\r{committed_text}{YELLOW}{' '.join(active_words)} "
+
+            if display != last_render:
+                print(display.ljust(120), end="", flush=True)
+                last_render = display
+
+    except KeyboardInterrupt:
+        print("\nStopping...")
+        args.stop_event.set()
+    finally:
+        t.join()
+        tail_raw = raw_text[committed_ptr:]
+        if tail_raw.strip():
+            committed_text += punc_model.infer([tail_raw])[0]
+        print(f"\r{committed_text.strip()} ")
+        print("\nDone.")
+
+# ===== entry =====
 if __name__ == "__main__":
-    # Cấu hình ưu tiên độ ổn định và chính xác
-    sys.argv = [
-        "realtime_asr_punct.py",
-        "--model_checkpoint", CHUNKFORMER_CHECKPOINT,
-        "--mic",
-        "--mic_sr", "16000",
-
-        # Cân bằng giữa độ trễ và độ chính xác
-        "--stream_chunk_sec", "0.5",
-        "--lookahead_sec", "0.5",
-        "--left_context_size", "32",
-        "--right_context_size", "32",
-
-        # Cài đặt để văn bản "chốt" nhanh và ít thay đổi
-        "--stable_reserve_words", "1",
-        "--idle_flush_chunks", "0",   # chốt khi ngừng nói
-        "--max_tail_chars", "40",
-        # "--punct_flush",           # chốt khi có dấu câu cuối câu (bật nếu muốn)
-
-        # Tham số kỹ thuật
-        "--lcs_window", "64",
-        "--lcs_min", "16",
-        "--use_gpu_mel",
-
-        # Bật và cấu hình mô hình dấu câu
-        "--enable_punct",
-        "--punct_device", "gpu",      # nếu tranh tài nguyên, đổi "cpu"
-        "--punct_rate_hz", "5.0",
-        "--punct_reserve_words", "0",
-
-        # Hiệu ứng giao diện
-        "--ansi_dim_tail",
-        "--show_tail",
-    ]
+    if len(sys.argv) == 1:
+        sys.argv = [
+            "realtime_decode.py",
+            "--model_checkpoint", "/home/trinhchau/code/EduAssist/api/services/chunkformer-large-vie",
+            "--punc_device", "cuda",
+            "--stream_chunk_sec", "0.5",
+            "--lookahead_sec", "0.2",
+            "--punc_processing_window_words", "400",
+            "--punc_window_words", "240",
+            "--punc_commit_margin_words", "120",
+            "--punc_context_overlap_words", "3",
+            "--left_context_size", "128",
+            "--right_context_size", "32",
+            "--cpu_threads", "1",
+        ]
     main()
