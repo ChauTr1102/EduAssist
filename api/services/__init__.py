@@ -4,6 +4,7 @@ from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmb
 from langchain_huggingface.embeddings import HuggingFaceEmbeddings
 from langchain_openai import OpenAIEmbeddings
 # from langchain.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain.prompts.chat import ChatPromptTemplate
 from pydantic import BaseModel
 from dotenv import load_dotenv, find_dotenv
 # from langchain.callbacks import AsyncIteratorCallbackHandler
