@@ -2,10 +2,11 @@ from api.services.chunkformer_stt import ChunkFormer
 from api.services.vcdb_faiss import VectorStore
 from api.private_config import *
 from collections import deque
+from punctuators.models import PunctCapSegModelONNX
 
 chunkformer = ChunkFormer(model_checkpoint=CHUNKFORMER_CHECKPOINT)
-faiss = VectorStore("hop_nextstart")
-
+# faiss = VectorStore("hop_nextstart")
+punct_model = PunctCapSegModelONNX.from_pretrained("1-800-BAD-CODE/xlm-roberta_punctuation_fullstop_truecase")
 buffer = deque()
 
 NUMBER_WORD = 200
@@ -49,16 +50,11 @@ def on_update(event, payload, full):
 
 
 def just_print(event, payload, full):
-    """
-    event: "commit" | "flush" | "final_flush"
-    payload: {"start": int(ms), "end": int(ms), "text": str}
-    full: toàn bộ transcript tới thời điểm hiện tại (không dùng ở đây)
-    """
     print(payload["text"], end=" ")
 
 final_text = chunkformer.stream_mic(
     stream_chunk_sec=0.5,
-    left_context_size=128, right_context_size=8,
+    left_context_size=128, right_context_size=64,
     mic_sr=16000, lookahead_sec=0.5,
     silence_rms=0.005, silence_runs=3,
     stable_reserve_words=3,
