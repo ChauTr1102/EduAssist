@@ -306,7 +306,7 @@ if __name__ == "__main__":
             "--model_checkpoint", "/home/trinhchau/code/EduAssist/api/services/chunkformer-large-vie",
             "--punc_device", "cuda",
             "--stream_chunk_sec", "0.5",
-            "--lookahead_sec", "0.2",
+            "--lookahead_sec", "0.5",
             "--punc_processing_window_words", "400",
             "--punc_window_words", "240",
             "--punc_commit_margin_words", "120",
