@@ -29,6 +29,8 @@ Hãy thực hiện đồng thời các yêu cầu sau với mỗi đoạn văn �
 - Trình bày lại thành một câu truy vấn đơn giản, súc tích, dễ dùng cho tìm kiếm tài liệu.
 - Không tóm tắt quá mức làm mất ý quan trọng. Không thay đổi nghĩa gốc.
 4. Giữ tiếng Việt. Không giải thích gì thêm. Trả về duy nhất 1 chuỗi truy vấn đã chuẩn hóa và rút gọn. Không bao bọc mã, không thêm gì khác. Đừng dùng tiếng Trung Quốc trong câu trả lời của bạn 
+5. **Nếu nội dung đoạn văn không liên quan đến cuộc họp, hội nghị, biên bản, hoặc tài liệu họp (ví dụ: nói về chuyện cá nhân, cảm xúc, đời sống, quảng cáo, hay không có ngữ cảnh họp), hãy trả về đúng chuỗi “None” (chữ N viết hoa, không có gì khác).**
+
 
 Ví dụ
 “Hẹn chín giờ ba mươi ở Luân Đôn ngày hai mươi ba tháng mười một để trao đổi hợp đồng”
@@ -59,7 +61,11 @@ SYSTEM_DOCUMENT = "./data/data_system"
 USER_DOCUMENT = "./data/data_user"
 
 # Load data
-CHUNK_SIZE = 1500
-CHUNK_OVERLAP = 200
+CHUNK_SIZE = 1000
+CHUNK_OVERLAP = 100
 
-MODEL_EMBEDDING = "AITeamVN/Vietnamese_Embedding"
+MODEL_EMBEDDING = "Alibaba-NLP/gte-multilingual-base"
+# AITeamVN/Vietnamese_Embedding
+# huyydangg/DEk21_hcmute_embedding
+# Alibaba-NLP/gte-multilingual-base
+# google/embeddinggemma-300m
