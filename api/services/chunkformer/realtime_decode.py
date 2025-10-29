@@ -313,7 +313,7 @@ if __name__ == "__main__":
     import sys
     sys.argv = [
         "realtime_decode.py",
-        "--model_checkpoint", "/home/trinhchau/code/EduAssist/api/services/chunkformer-large-vie",
+        "--model_checkpoint", "/home/manh/chunkformer/chunkformer/chunkformer-large-vie",
         "--mic",
         "--mic_sr", "16000",
         "--left_context_size", "16",
