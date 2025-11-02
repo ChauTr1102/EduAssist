@@ -11,6 +11,7 @@ from langchain_community.vectorstores import FAISS
 import os
 from fastapi import UploadFile, File, Form
 import shutil
+from langchain_classic.retrievers.ensemble import EnsembleRetriever
 from langchain_community.retrievers import BM25Retriever
 from langchain_experimental.text_splitter import SemanticChunker
 import tiktoken
@@ -36,7 +37,6 @@ class VectorStore:
             self.bm25_retriever = None
 
     def hybrid_search(self, question):
-        from langchain.retrievers.ensemble import EnsembleRetriever
         ensemble_retriever = EnsembleRetriever(retrievers=[self.bm25_retriever, self.cosine_retriever],
                                                weights=[0.5, 0.5])
 

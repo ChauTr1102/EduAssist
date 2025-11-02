@@ -18,7 +18,7 @@ job_queue = Queue(maxsize=0)
 
 chunkformer = ChunkFormer(model_checkpoint=CHUNKFORMER_CHECKPOINT)
 llm = LanguageModelOllama("qwen3:8b", temperature=0.5)
-faiss = VectorStore("LichSuDangVietNam")
+faiss = VectorStore("Baocaouyvienbochinhtri")
 
 ## Punct model dùng CPU
 punct_model = PunctCapSegModelONNX.from_pretrained("1-800-BAD-CODE/xlm-roberta_punctuation_fullstop_truecase",
@@ -31,6 +31,7 @@ results = []
 def on_emit_from_timer(event: str, payload: dict, full_text: str):
     # event sẽ là "timeout_flush" (do mình đặt), hoặc "flush"/"final_flush" nếu bạn chủ động gọi
     results.append(full_text)
+    print("___________________________________________________________________________________________________________")
     print("[EMIT]", event, "→", payload["text"])
     job_queue.put(full_text)
 
@@ -48,9 +49,11 @@ def worker_loop(worker_id: int):
             # 1) Gọi LLM để xử lý
             prompt = llm.normalize_text(text)
             response = llm.generate(prompt=prompt)
+            print("Câu đã được chuẩn hóa và tối ưu:", response)
+            print("___________________________________________________________________________________________________________")
 
             related_docs = faiss.hybrid_search(response)
-            print(f"Related Documents: {related_docs}")
+            # print(f"Related Documents: {related_docs}")
 
         except Exception as e:
             print(f"[Worker-{worker_id}] ERROR processing job: {e}")
@@ -69,14 +72,14 @@ start_workers(num_workers=2)
 # 4) Tạo processor với on_emit
 proc = PunctProcessor(
     model=punct_model,
-    number_payload=20,
+    number_payload=50,
     timeout_sec=5.0,       # im lặng 5 giây thì tự flush phần còn lại
     on_emit=on_emit_from_timer
 )
 
 # 5) Callback mà ASR sẽ gọi mỗi lần có update
 def on_update(event: str, payload: dict, full: str):
-    # print(payload["text"])
+    # print(payload["text"], end=" ")
     out = proc.punct_process(event, payload, full)
 
 # after ASR ends
