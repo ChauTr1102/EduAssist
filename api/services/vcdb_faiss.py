@@ -41,7 +41,7 @@ class VectorStore:
                                                weights=[0.5, 0.5])
 
         compressed_docs = ensemble_retriever.invoke(question)
-        content_text = "\n\n---\n\n".join([doc.page_content for doc in compressed_docs[:6]])
+        content_text = "\n\n---\n\n".join([doc.page_content for doc in compressed_docs[:4]])
         return content_text
 
     def recursive_chunking(self, file_path):

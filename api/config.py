@@ -51,6 +51,33 @@ Hãy chuẩn hóa và tối ưu truy vấn của đoạn văn sau:
 {text}
 """
 
+SUMMARIZE_DOCUMENT_PROMPT = """
+Bạn là một trợ lý họp chuyên nghiệp, có nhiệm vụ tạo bản tóm tắt rõ ràng, súc tích và có định hướng hành động từ phát biểu của người đang nói + các tài liệu liên quan đã được tìm và trích xuất.
+
+Yêu cầu đầu ra:
+1. Mở đầu bằng một câu ngắn về mục đích phát biểu này trong cuộc họp.
+2. Liệt kê những ý chính người nói nêu ra (2‑4 bullet).
+3. Nêu rõ quyết định hoặc kết luận (nếu có) từ phát biểu.
+4. Trích xuất việc cần làm / hành động tiếp theo (nếu có): mỗi việc gồm mô tả, chủ thể chịu trách nhiệm, thời hạn (nếu đề cập).
+5. Kết thúc bằng gợi ý cho bước tiếp theo trong cuộc họp hoặc theo dõi sau cuộc họp.
+
+Định dạng:
+- Sử dụng tiếng Việt.
+- Dùng bullet points (“- …”) cho các ý chính và mục hành động.
+- Giữ độ dài hợp lý: khoảng 1–2 đoạn mở đầu + 4‑6 bullet tổng hợp + 1 đoạn kết.
+- Tránh trùng lặp nội dung, tránh lan man.
+
+Gắn nhãn rõ ràng (**Nếu có**) như: Mục đích, Ý chính, Quyết định/Kết luận, Hành động tiếp theo. Mô tả … → Chủ thể: … → Thời hạn: … Bước tiếp theo: …
+
+
+**Phát biểu (đã chuẩn hóa) của người đang nói:**
+
+{utterance}
+
+**Tài liệu liên quan đã được trích xuất:**
+{related_docs}"""
+
+
 # Retriever
 SEARCH_KWARGS = {'k': 25, 'score_threshold': 0.01, 'sorted': True}
 SEARCH_TYPE = "similarity_score_threshold"
