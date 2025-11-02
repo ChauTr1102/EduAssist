@@ -11,7 +11,7 @@ from langchain_community.vectorstores import FAISS
 import os
 from fastapi import UploadFile, File, Form
 import shutil
-# from langchain.retrievers.ensemble import EnsembleRetriever
+from langchain_classic.retrievers.ensemble import EnsembleRetriever
 from langchain_community.retrievers import BM25Retriever
 from langchain_experimental.text_splitter import SemanticChunker
 import tiktoken
@@ -23,7 +23,7 @@ class VectorStore:
                                                             length_function=len)
         # self.model_embedding = GoogleGenerativeAIEmbeddings(model=MODEL_EMBEDDING, google_api_key=openai_embedding_key)
         self.meeting_id = meeting_id
-        self.model_embedding = HuggingFaceEmbeddings(model_name="AITeamVN/Vietnamese_Embedding")
+        self.model_embedding = HuggingFaceEmbeddings(model_name=MODEL_EMBEDDING, model_kwargs={"trust_remote_code": True})
         try:
             self.db = FAISS.load_local(f'{VECTOR_DATABASE}/{meeting_id}', self.model_embedding,
                                        allow_dangerous_deserialization=True)
@@ -35,6 +35,14 @@ class VectorStore:
             self.db = None
             self.retriever = None
             self.bm25_retriever = None
+
+    def hybrid_search(self, question):
+        ensemble_retriever = EnsembleRetriever(retrievers=[self.bm25_retriever, self.cosine_retriever],
+                                               weights=[0.5, 0.5])
+
+        compressed_docs = ensemble_retriever.invoke(question)
+        content_text = "\n\n---\n\n".join([doc.page_content for doc in compressed_docs[:4]])
+        return content_text
 
     def recursive_chunking(self, file_path):
         file_extension = os.path.splitext(file_path)[1].lower()
@@ -118,6 +126,9 @@ class VectorStore:
     def create_vectorstore(self, chunks):
         db = FAISS.from_documents(chunks, self.model_embedding)
         return db
+
+    def faiss_save_local(self, db):
+        db.save_local(f'{VECTOR_DATABASE}/{self.meeting_id}')
 
     # thêm vào vectorstore
     def merge_to_vectorstore(self, old_db, new_db, meeting_id):
