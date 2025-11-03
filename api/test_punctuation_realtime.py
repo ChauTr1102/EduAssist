@@ -24,7 +24,12 @@ summarizer_queue = Queue(maxsize=0)
 
 chunkformer = ChunkFormer(model_checkpoint=CHUNKFORMER_CHECKPOINT)
 # Lưu ý: class này phải có async_generate như bạn vừa cập nhật
-llm = LanguageModelOllama("qwen3:8b", temperature=0.5)
+llm = LanguageModelOllama("shmily_006/Qw3:4b_4bit", temperature=0.5)
+
+# qwen3:8b
+# shmily_006/Qw3:4b_4bit
+# hf.co/bartowski/Meta-Llama-3.1-8B-Instruct-GGUF:q4_K_M
+
 faiss = VectorStore("Baocaouyvienbochinhtri")
 
 ## Punct model dùng CPU
@@ -97,8 +102,8 @@ def worker_loop(worker_id: int):
             # 1) Chuẩn hoá bằng async_generate (non-stream) chạy trên loop nền
             normalize_prompt = llm.normalize_text(text)
             normalized = run_async(llm.async_generate(normalize_prompt), timeout=60.0)
-            # print("Câu đã được chuẩn hóa và tối ưu:", normalized)
-            # print("___________________________________________________________________________________________________________")
+            print("Câu đã được chuẩn hóa và tối ưu:", normalized)
+            print("___________________________________________________________________________________________________________")
 
             if not normalized or normalized.strip().casefold() == "none":
                 continue
@@ -170,7 +175,7 @@ start_summarizer()
 # =========================
 proc = PunctProcessor(
     model=punct_model,
-    number_payload=50,
+    number_payload=30,
     timeout_sec=5.0,       # im lặng 5 giây thì tự flush phần còn lại
     on_emit=on_emit_from_timer
 )
