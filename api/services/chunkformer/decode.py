@@ -302,22 +302,22 @@ def main():
     end_time = time.time()
     processing_time = round(end_time - start_time, 3)
     print(processing_time)
-if __name__ == "__main__":
-    import sys
-
-    # ghi cứng tham số để chạy trực tiếp
-    sys.argv = [
-        "decode.py",
-        "--model_checkpoint", "../chunkformer-large-vie",
-        "--long_form_audio", "/home/bojjoo/Code/EduAssist/test_data/test2.wav",
-        # "--audio_list", "/home/bojjoo/Code/EduAssist/api/services/chunkformer/data/audio_list.tsv",
-        "--total_batch_duration", "1",
-        "--chunk_size", "1",
-        "--left_context_size", "128",
-        "--right_context_size", "16",
-        "--device", "cuda",
-        "--autocast_dtype", "fp32",
-    ]
-
-    main()
+# if __name__ == "__main__":
+#     import sys
+#
+#     # ghi cứng tham số để chạy trực tiếp
+#     sys.argv = [
+#         "decode.py",
+#         "--model_checkpoint", "/home/bojjoo/Code/EduAssist/api/services/chunkformer/chunkformer-large-vie",
+#         "--long_form_audio", "/home/bojjoo/Code/EduAssist/test_data/test2.wav",
+#         # "--audio_list", "/home/bojjoo/Code/EduAssist/api/services/chunkformer/data/audio_list.tsv",
+#         "--total_batch_duration", "1",
+#         "--chunk_size", "1",
+#         "--left_context_size", "128",
+#         "--right_context_size", "16",
+#         "--device", "cuda",
+#         "--autocast_dtype", "fp32",
+#     ]
+#
+main()
 

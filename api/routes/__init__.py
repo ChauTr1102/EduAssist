@@ -3,7 +3,7 @@ from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel, EmailStr, validator, Field
 from dotenv import load_dotenv
 import tempfile
-from api.services.whisper import FasterWhisper
+# from api.services.whisper import FasterWhisper
 from api.services.chunkformer_stt import ChunkFormer
 from api.services.llm import LLM
 import logging
@@ -13,7 +13,8 @@ from typing import Optional
 import sys
 import os
 import httpx
-from api.services.local_llm import ChatRequest
+# from api.services.local_llm import ChatRequest
+from api.services.local_llm import LanguageModelOllama
 from api.services.video_to_audio_convert import *
 import pynvml
 # import bộ đo GPU
@@ -61,3 +62,7 @@ class UserInput(BaseModel):
     user_input: str
     summarize_script: str
     history: str
+
+
+class ChatRequest(BaseModel):
+    prompt: str
