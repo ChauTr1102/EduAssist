@@ -1,7 +1,7 @@
 from api.services import *
 import subprocess, sys
 import time
-
+from api.private_config import *
 from pathlib import Path
 import sys
 import sounddevice as sd
@@ -574,3 +574,195 @@ class ChunkFormer:
             if return_final:
                 return " ".join(transcript_parts).strip()
             return ""
+
+    @torch.no_grad()
+    def stream_from_iterable(
+            self,
+            audio_iter,
+            sr: int = 16000,
+            stream_chunk_sec: float = 0.5,
+            lookahead_sec: float = 0.5,
+            left_context_size: int = 128,
+            right_context_size: int = 32,
+            max_overlap_match: int = 32,
+            on_update=None,
+            return_final: bool = True,
+    ):
+        """
+        Realtime ASR từ một iterable audio thay vì microphone.
+
+        `audio_iter` yield:
+          - bytes (PCM16LE mono) hoặc
+          - np.ndarray / list float32/float64/ int16 shape (N,) mono
+
+        Emit:
+          - event="commit": đoạn text mới ổn định
+          - event="final_flush": flush phần còn lại khi kết thúc
+        Payload: {"start": <ms>, "end": <ms>, "text": <str>}
+        """
+
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        def _emit(event_type: str, payload, full_text: str):
+            if on_update is not None:
+                on_update(event_type, payload, full_text)
+
+        # --- encoder params như hàm cũ ---
+        subsampling = self.model.encoder.embed.subsampling_factor
+        num_layers = self.model.encoder.num_blocks
+        conv_lorder = self.model.encoder.cnn_module_kernel // 2
+
+        enc_steps = max(1, int(round((stream_chunk_sec / 0.01) / subsampling)))
+        chunk_size = enc_steps
+
+        att_cache = torch.zeros(
+            (num_layers, left_context_size, self.model.encoder.attention_heads,
+             self.model.encoder._output_size * 2 // self.model.encoder.attention_heads),
+            device=device
+        )
+        cnn_cache = torch.zeros(
+            (num_layers, self.model.encoder._output_size, conv_lorder),
+            device=device
+        )
+        offset = torch.zeros(1, dtype=torch.int, device=device)
+
+        block_samples = int(stream_chunk_sec * sr)
+        lookahead_blk = max(0, int(math.ceil(lookahead_sec / stream_chunk_sec)))
+        q_audio = deque(maxlen=1 + lookahead_blk)
+
+        full_hyp = ""
+        transcript_parts = []
+        produced_steps = 0
+
+        def to_float_mono(block):
+            # bytes -> int16 -> float32
+            if isinstance(block, (bytes, bytearray, memoryview)):
+                arr = np.frombuffer(block, dtype=np.int16).astype(np.float32)
+            else:
+                arr = np.array(block, copy=False)
+                if arr.dtype == np.int16:
+                    arr = arr.astype(np.float32)
+                else:
+                    arr = arr.astype(np.float32)
+            # mono
+            if arr.ndim > 1:
+                arr = arr.mean(axis=1)
+            # scale giống hàm cũ: fbank(seg * 32768)
+            arr = arr / 32768.0  # chuẩn hóa về [-1,1] nếu cần
+            return arr
+
+        try:
+            for block in audio_iter:
+                if block is None:
+                    break
+
+                audio_block = to_float_mono(block)
+                if audio_block.size == 0:
+                    continue
+
+                # nếu block dài hơn block_samples thì cắt thành các khung
+                start = 0
+                while start < audio_block.size:
+                    end = min(start + block_samples, audio_block.size)
+                    frame = audio_block[start:end]
+                    start = end
+
+                    # nếu frame nhỏ hơn block_samples, vẫn dùng (được bù bởi lookahead)
+                    q_audio.append(frame.astype(np.float32, copy=True))
+
+                    if len(q_audio) < 1 + lookahead_blk:
+                        continue
+
+                    seg_np = np.concatenate(q_audio).astype(np.float32)
+                    if seg_np.size < int(0.025 * sr):
+                        continue
+
+                    # fbank như cũ
+                    seg = torch.from_numpy(seg_np).unsqueeze(0).to(device) * 32768.0
+                    x = kaldi.fbank(
+                        seg, num_mel_bins=80, frame_length=25, frame_shift=10,
+                        dither=0.0, energy_floor=0.0, sample_frequency=sr
+                    ).unsqueeze(0).to(device)
+                    x_len = torch.tensor([x.size(1)], dtype=torch.int, device=device)
+
+                    with torch.cuda.amp.autocast(dtype=torch.float16):
+                        enc_out, enc_len, _, att_cache, cnn_cache, offset = \
+                            self.model.encoder.forward_parallel_chunk(
+                                xs=x,
+                                xs_origin_lens=x_len,
+                                chunk_size=chunk_size,
+                                left_context_size=left_context_size,
+                                right_context_size=right_context_size,
+                                att_cache=att_cache,
+                                cnn_cache=cnn_cache,
+                                truncated_context_size=chunk_size,
+                                offset=offset
+                            )
+
+                        T = int(enc_len.item())
+                        enc_out = enc_out.reshape(1, -1, enc_out.size(-1))[:, :T]
+                        if enc_out.size(1) > chunk_size:
+                            enc_out = enc_out[:, :chunk_size]
+                        offset = offset - T + enc_out.size(1)
+
+                        hyp_step = self.model.encoder.ctc_forward(enc_out).squeeze(0).cpu()
+
+                    seg_start_ms = int(produced_steps * subsampling * 10)
+                    seg_end_ms = int((produced_steps + hyp_step.numel()) * subsampling * 10)
+                    produced_steps += hyp_step.numel()
+
+                    chunk_text = get_output([hyp_step], self.char_dict)[0]
+                    ovl = longest_suffix_prefix_overlap(full_hyp, chunk_text, max_k=max_overlap_match)
+                    new_piece = chunk_text[ovl:] if ovl < len(chunk_text) else ""
+
+                    if new_piece.strip():
+                        full_hyp += new_piece
+                        cleaned = new_piece.strip()
+                        transcript_parts.append(cleaned)
+                        payload = {"start": seg_start_ms, "end": seg_end_ms, "text": cleaned}
+                        _emit("commit", payload, " ".join(transcript_parts).strip())
+
+                    # trượt cửa sổ
+                    if q_audio:
+                        q_audio.popleft()
+
+                    torch.cuda.empty_cache()
+
+        finally:
+            # flush nốt
+            full_now = " ".join(transcript_parts).strip()
+            if full_hyp.strip() and full_now != full_hyp.strip():
+                remaining = full_hyp[len(full_now):].strip()
+                if remaining:
+                    transcript_parts.append(remaining)
+                    payload = {"start": 0, "end": 0, "text": remaining}
+                    _emit("final_flush", payload, " ".join(transcript_parts).strip())
+            else:
+                # emit final_flush trống cho rõ vòng đời
+                _emit("final_flush", {"start": 0, "end": 0, "text": ""}, full_now)
+
+        return " ".join(transcript_parts).strip() if return_final else ""
+
+
+    def run_chunkformer_stt(self,audio_path):
+        cmd = [
+            sys.executable, "api/services/chunkformer/decode.py" ,
+            "--model_checkpoint", CHUNKFORMER_CHECKPOINT,
+            "--long_form_audio", audio_path,
+            "--total_batch_duration", "18000",
+            "--chunk_size", "64",
+            "--left_context_size", "128",
+            "--right_context_size", "128",
+            "--device", "cuda" ,
+            "--autocast_dtype", "fp16",
+        ]
+        # capture_output=True để lấy transcript về
+        result = subprocess.run(cmd, text=True, capture_output=True)
+        # print(result.stdout)
+        stederr = None
+        if result.stderr:
+            stederr = result.stderr
+        return {
+            "transcribe_by_sentence": result.stdout,
+            "stederr": stederr,
+        }
