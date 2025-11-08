@@ -3,10 +3,6 @@ import pynini
 import os
 import argparse
 
-def parse_args():
-	parser = argparse.ArgumentParser(description="Inverse normalize text")
-	parser.add_argument("input", type=str, help="input text")
-	return parser.parse_args()
 
 
 def inverse_normalize(s: str, verbose=False) -> str:
@@ -20,7 +16,4 @@ def inverse_normalize(s: str, verbose=False) -> str:
 		print(token)
 	return top_rewrite(token, verbalizer)
 
-if __name__ == "__main__":
-	arg = parse_args()
-	print(inverse_normalize(arg.input))
 
