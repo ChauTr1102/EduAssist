@@ -747,7 +747,7 @@ class ChunkFormer:
     def run_chunkformer_stt(self,audio_path):
         cmd = [
             sys.executable, "api/services/chunkformer/decode.py" ,
-            "--model_checkpoint", "/home/bojjoo/Code/EduAssist/api/services/chunkformer/chunkformer-large-vie",
+            "--model_checkpoint", CHUNKFORMER_CHECKPOINT,
             "--long_form_audio", audio_path,
             "--total_batch_duration", "18000",
             "--chunk_size", "64",
