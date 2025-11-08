@@ -575,13 +575,13 @@ if __name__ == "__main__":
 
             # Tham số VAD (mới)
             "--vad_threshold", "0.01",
-            "--vad_min_silence_blocks", "5",
+            "--vad_min_silence_blocks", "2",
 
             # Tham số Punc (mới)
-            "--punc_processing_window_words", "72",
-            "--punc_window_words", "48",
-            "--punc_commit_margin_words", "10",
-            "--punc_context_overlap_words", "5",
+            "--punc_processing_window_words", "400",
+            "--punc_window_words", "240",
+            "--punc_commit_margin_words", "120",
+            "--punc_context_overlap_words", "3",
 
             # Tham số Logic (mới)
             "--rate_limit_words", "4",
