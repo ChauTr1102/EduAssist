@@ -1,7 +1,7 @@
 import os, math, argparse, yaml, re, sys, threading, queue, contextlib
 from collections import deque
 import traceback
-
+from api.private_config import *
 import numpy as np
 import torch, torchaudio
 import torchaudio.compliance.kaldi as kaldi
@@ -558,11 +558,11 @@ def main():
 if __name__ == "__main__":
     # Dùng các tham số mới được đề xuất
     if len(sys.argv) == 1:
-        itn_repo_path = "/home/trinhchau/code/EduAssist/api/services/Vietnamese-Inverse-Text-Normalization"
+        itn_repo_path = ITN_REPO
 
         sys.argv = [
             "realtime_decode.py",
-            "--model_checkpoint", "/home/trinhchau/code/EduAssist/api/services/chunkformer-large-vie",
+            "--model_checkpoint", CHUNKFORMER_CHECKPOINT,
             "--itn_model_dir", itn_repo_path,
             "--punc_device", "cuda",
             "--cpu_threads", "2",
