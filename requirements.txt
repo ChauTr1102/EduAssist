@@ -161,3 +161,4 @@ webrtcvad-wheels==2.0.14
 websockets==15.0.1
 yarl==1.20.1
 zstandard==0.23.0
+pynini==2.1.7

@@ -31,7 +31,6 @@ def get_model_info():
     return call_api("model-info")
 
 
-
 def update_model_info():
     """Cập nhật thông tin model trên giao diện"""
     info = get_model_info()
@@ -45,7 +44,8 @@ def update_model_info():
     - Đường dẫn: `{info.get('model_path', 'N/A')}`
     """
 
-def extract_video_to_audio(video_path:str,output_dir: Optional[str] = None):
+
+def extract_video_to_audio(video_path: str, output_dir: Optional[str] = None):
     global current_video_path
     if not os.path.exists(video_path):
         raise FileNotFoundError(f"Video file not found: {video_path}")
@@ -99,6 +99,7 @@ def get_transcribe(audio_path: str):
 
 def random_response(message, history):
     return random.choice(["Yes", "No"])
+
 
 def summarization(transcript: str, user_prompt: str) -> str:
     """
@@ -168,10 +169,10 @@ def summarization_gemini(transcript: str, user_prompt: str) -> str:
     prompt = f"""Bạn sẽ nhận được một lời nhắc từ người dùng và một đoạn hội thoại được tách ra từ file audio, 
     hãy phân tích và tóm tắt lại nội dung có trong cuộc hội thoại đó theo yêu cầu của người dùng. Nếu không có yêu cầu nào từ người dùng,
     hãy tóm tắt lại theo yêu cầu của hệ thống.
-    
+
     Lời nhắc của người dùng:
     {user_prompt}
-    
+
     Chi tiết cuộc hội thoại:
     {transcript}
     """
@@ -201,6 +202,7 @@ def summarization_gemini(transcript: str, user_prompt: str) -> str:
         return f"⚠️ Lỗi xử lý dữ liệu: {str(e)}"
     except Exception as e:
         return f"⚠️ Lỗi không xác định: {str(e)}"
+
 
 def chat_summary_interface(message, history, summarize_script):
     # Chuẩn hóa history thành text
@@ -318,7 +320,7 @@ with gr.Blocks(title="Meeting Secretary") as demo:
                     interactive=True
                 )
 
-                gr.ChatInterface(get_response_from_bot, type="messages", autofocus=False,fill_height=True,
+                gr.ChatInterface(get_response_from_bot, type="messages", autofocus=False, fill_height=True,
                                  save_history=True, additional_inputs=summarization_box)
 
         download_box = gr.Textbox(
@@ -345,9 +347,9 @@ with gr.Blocks(title="Meeting Secretary") as demo:
         inputs=download_box,
         outputs=output_text
     ).then(
-        fn = summarization,
-         inputs =[output_text, prompt_box],
-        outputs = summarization_box
+        fn=summarization,
+        inputs=[output_text, prompt_box],
+        outputs=summarization_box
     )
 
     # Bấm Summarise Again
@@ -376,7 +378,6 @@ with gr.Blocks(title="Meeting Secretary") as demo:
                 )
                 on_submit_video_btn = gr.Button("Transcribe", variant="primary")
 
-
             with gr.Column(scale=4):
                 on_prompt_box = gr.Textbox(
                     label="Your Prompt",
@@ -392,7 +393,6 @@ with gr.Blocks(title="Meeting Secretary") as demo:
                     interactive=True
                 )
                 on_summarise_btn = gr.Button("Summarise Again", variant="secondary")
-
 
             with gr.Column(scale=2):
                 on_output_text = gr.Textbox(
@@ -432,9 +432,9 @@ with gr.Blocks(title="Meeting Secretary") as demo:
         inputs=on_download_box,
         outputs=on_output_text
     ).then(
-        fn = summarization_gemini,
-        inputs =[on_output_text, on_prompt_box],
-        outputs = on_summarization_box
+        fn=summarization_gemini,
+        inputs=[on_output_text, on_prompt_box],
+        outputs=on_summarization_box
     )
 
     # Bấm Summarise Again
@@ -443,7 +443,6 @@ with gr.Blocks(title="Meeting Secretary") as demo:
         inputs=[on_output_text, on_prompt_box],
         outputs=on_summarization_box
     )
-
 
 if __name__ == "__main__":
     demo.launch(server_port=7860, share=True)
