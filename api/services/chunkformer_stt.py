@@ -17,7 +17,7 @@ if str(HERE) not in sys.path:
 if str(CHUNKFORMER_DIR) not in sys.path:
     sys.path.insert(0, str(CHUNKFORMER_DIR))
 
-
+import  contextlib
 import os
 import math
 import argparse
@@ -38,7 +38,8 @@ from chunkformer.model.utils.init_model import init_model
 from chunkformer.model.utils.checkpoint import load_checkpoint
 from chunkformer.model.utils.file_utils import read_symbol_table
 from chunkformer.model.utils.ctc_utils import get_output_with_timestamps, get_output, milliseconds_to_hhmmssms
-
+from pynini.lib.rewrite import top_rewrite
+from pynini.lib import rewrite
 # ==================== Utils for stable streaming without CIF ====================
 
 def _longest_suffix_prefix_overlap(a: str, b: str, max_k: int = 32) -> int:
@@ -283,7 +284,7 @@ class ChunkFormer:
     # ==================== Microphone streaming with fixed lookahead ====================
 
     @torch.no_grad()
-    def stream_mic(self, stream_chunk_sec: float,
+    def stream_mic_silent_rms(self, stream_chunk_sec: float,
                    left_context_size, right_context_size,
                    mic_sr, lookahead_sec: float,
                    silence_rms, silence_runs,
@@ -432,7 +433,7 @@ class ChunkFormer:
     @torch.no_grad()
     def chunkformer_asr_realtime(self, mic_sr: int = 16000, stream_chunk_sec: float = 0.5
                                 , lookahead_sec: float = 0.5, left_context_size: int = 128, right_context_size: int = 32
-                                , max_overlap_match: int = 32, on_update=None, return_final: bool = True):
+                                , max_overlap_match: int = 32, on_update=None, return_final: bool = True, stop_event=None):
         """
         Realtime ASR từ microphone cho đến khi Ctrl+C.
         Giữ logic: fbank -> forward_parallel_chunk -> CTC -> ghép overlap (suffix-prefix).
@@ -486,6 +487,10 @@ class ChunkFormer:
             with sd.InputStream(samplerate=mic_sr, channels=1, dtype="float32",
                                 blocksize=block_samples) as stream:
                 while True:
+
+                    if stop_event is not None and stop_event.is_set():
+                        break
+
                     audio_block, _ = stream.read(block_samples)
                     # mono float32
                     q_audio.append(np.squeeze(audio_block, axis=1).astype(np.float32, copy=True))
@@ -576,38 +581,67 @@ class ChunkFormer:
             return ""
 
     @torch.no_grad()
-    def stream_from_iterable(
-            self,
-            audio_iter,
-            sr: int = 16000,
-            stream_chunk_sec: float = 0.5,
-            lookahead_sec: float = 0.5,
-            left_context_size: int = 128,
-            right_context_size: int = 32,
-            max_overlap_match: int = 32,
-            on_update=None,
-            return_final: bool = True,
+    def chunkformer_asr_realtime_punc_norm(self, mic_sr: int = 16000, stream_chunk_sec: float = 0.5, lookahead_sec: float = 0.5,
+                                left_context_size: int = 128, right_context_size: int = 32, max_overlap_match: int = 32,
+                                # VAD
+                                vad_threshold: float = 0.01, vad_min_silence_blocks: int = 2,
+
+                                # Punctuation
+                                punc_model=None, use_sbd: bool = False, punc_window_words: int = 240,
+                                punc_commit_margin_words: int = 120, punc_processing_window_words: int = 400,
+                                punc_context_overlap_words: int = 3,
+
+                                # ITN
+                                itn_classifier=None, itn_verbalizer=None,
+
+                                # Logic
+                                rate_limit_words: int = 4, context_buffer_size: int = 300,
+
+                                # Control
+                                on_update=None, stop_event=None, return_final: bool = True,
     ):
         """
-        Realtime ASR từ một iterable audio thay vì microphone.
+        Realtime ASR + VAD + Punctuation + ITN (tích hợp chiến lược mới).
 
-        `audio_iter` yield:
-          - bytes (PCM16LE mono) hoặc
-          - np.ndarray / list float32/float64/ int16 shape (N,) mono
+        - Đọc từ microphone trên server (sounddevice).
+        - ASR streaming với ChunkFormer (forward_parallel_chunk + CTC).
+        - VAD: phát hiện khoảng im lặng để ép commit.
+        - Punctuation + truecase + ITN: chạy theo cửa sổ ngữ cảnh, commit thông minh.
+        - on_update(event, payload) để UI/backend subscribe:
 
-        Emit:
-          - event="commit": đoạn text mới ổn định
-          - event="final_flush": flush phần còn lại khi kết thúc
-        Payload: {"start": <ms>, "end": <ms>, "text": <str>}
+            event="partial":
+                payload = {
+                    "display": <chuỗi đã format: committed + active>,
+                    "committed": <phần đã commit (ITN)>,
+                    "active": <phần active (ITN)>,
+                }
+
+            event="commit":
+                payload = {
+                    "new_commit": <đoạn ITN mới commit>,
+                    "committed": <toàn bộ committed (ITN)>,
+                }
+
+            event="final_flush":
+                payload = {
+                    "text": <toàn bộ ITN final>,
+                }
+
+        Lưu ý:
+        - punc_model, itn_classifier, itn_verbalizer phải được truyền từ ngoài (init 1 lần).
+        - Nếu không truyền punc/itn, hàm sẽ trả raw text như cũ (chỉ dùng ASR + VAD).
         """
 
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        def _emit(event_type: str, payload, full_text: str):
+        def _emit(event: str, payload: dict):
             if on_update is not None:
-                on_update(event_type, payload, full_text)
+                try:
+                    on_update(event, payload)
+                except Exception as e:
+                    print(f"[chunkformer_asr_realtime_2][on_update error] {e}", flush=True)
 
-        # --- encoder params như hàm cũ ---
+        # ====== ASR encoder setup ======
         subsampling = self.model.encoder.embed.subsampling_factor
         num_layers = self.model.encoder.num_blocks
         conv_lorder = self.model.encoder.cnn_module_kernel // 2
@@ -615,69 +649,279 @@ class ChunkFormer:
         enc_steps = max(1, int(round((stream_chunk_sec / 0.01) / subsampling)))
         chunk_size = enc_steps
 
-        att_cache = torch.zeros(
-            (num_layers, left_context_size, self.model.encoder.attention_heads,
-             self.model.encoder._output_size * 2 // self.model.encoder.attention_heads),
-            device=device
-        )
-        cnn_cache = torch.zeros(
-            (num_layers, self.model.encoder._output_size, conv_lorder),
-            device=device
-        )
+        att_cache = torch.zeros((num_layers, left_context_size, self.model.encoder.attention_heads,
+                                 self.model.encoder._output_size * 2 // self.model.encoder.attention_heads), device=device)
+        cnn_cache = torch.zeros((num_layers, self.model.encoder._output_size, conv_lorder), device=device)
         offset = torch.zeros(1, dtype=torch.int, device=device)
 
+        # ====== streaming audio params ======
+        sr = mic_sr
         block_samples = int(stream_chunk_sec * sr)
         lookahead_blk = max(0, int(math.ceil(lookahead_sec / stream_chunk_sec)))
         q_audio = deque(maxlen=1 + lookahead_blk)
 
-        full_hyp = ""
-        transcript_parts = []
-        produced_steps = 0
+        # ====== VAD state ======
+        silence_blocks = 0
+        was_speaking = False
 
-        def to_float_mono(block):
-            # bytes -> int16 -> float32
-            if isinstance(block, (bytes, bytearray, memoryview)):
-                arr = np.frombuffer(block, dtype=np.int16).astype(np.float32)
+        # ====== text / formatting state ======
+        # raw_text: toàn bộ giả thuyết CTC (lexical, no punc)
+        raw_text = ""
+        last_raw_sent = ""
+
+        # pointer trên raw_text đánh dấu phần đã commit (tính theo ký tự, chống drift)
+        committed_ptr = 0
+
+        # context (đã punctuated) dùng làm tiền tố cho lần punc tiếp theo
+        committed_text_punctuated_context = ""
+
+        # phần đã commit (đã ITN, để display)
+        committed_text_normalized_display = ""
+
+        # cache ITN cho phần "head" active
+        cached_itn_head = ("", "")
+
+        # rate limiting cho Punc/ITN
+        last_punc_call_word_count = 0
+
+        # helper regex
+        WORD_RE = re.compile(r"[0-9A-Za-zÀ-Ỵà-ỵ]+")
+        TOKEN_RE = re.compile(r"\S+")
+        SENT_END_RE = re.compile(r"[\.!\?…]$")
+
+        def advance_pointer_by_words(full_text: str, start_idx: int, n_words: int) -> int:
+            cnt = 0
+            for m in WORD_RE.finditer(full_text, start_idx):
+                cnt += 1
+                if cnt == n_words:
+                    return m.end()
+            return len(full_text)
+
+        def inverse_normalize_local(s: str) -> str:
+            if itn_classifier is None or itn_verbalizer is None:
+                return s
+            if not s.strip():
+                return s
+            try:
+                token = top_rewrite(s, itn_classifier)
+                return top_rewrite(token, itn_verbalizer)
+            except rewrite.Error:
+                return s
+            except Exception as e:
+                print(f"[ITN] error: {e}", flush=True)
+                return s
+
+        def run_punc_itn_and_emit(force_commit: bool = False):
+            """
+            Chạy punctuation + ITN + commit logic trên raw_text hiện tại,
+            update committed_text_* và emit partial/commit.
+            """
+            nonlocal raw_text, committed_ptr
+            nonlocal committed_text_punctuated_context, committed_text_normalized_display
+            nonlocal cached_itn_head, last_punc_call_word_count
+
+            if punc_model is None:
+                # Không có punc/itn: emit raw luôn
+                _emit("partial", {
+                    "display": raw_text,
+                    "committed": raw_text,
+                    "active": "",
+                })
+                return
+
+            # 0. Rate limiting
+            current_raw_word_count = len(WORD_RE.findall(raw_text))
+            if not force_commit:
+                if current_raw_word_count - last_punc_call_word_count < rate_limit_words:
+                    return
+            last_punc_call_word_count = current_raw_word_count
+
+            # 1. Lấy phần tail chưa commit
+            tail_raw = raw_text[committed_ptr:]
+            if not tail_raw.strip():
+                return
+
+            tail_raw_words = WORD_RE.findall(tail_raw)
+            if not tail_raw_words:
+                return
+
+            # 2. Xây context cho punc
+            # Giới hạn độ dài context để tránh quá dài
+            context_text = committed_text_punctuated_context[-context_buffer_size:]
+            processing_window_raw = (context_text + " " + tail_raw).strip()
+
+            # 3. Gọi punctuation model
+            punct_window = punc_model.infer([processing_window_raw], apply_sbd=use_sbd)[0]
+
+            # 4. Tách phần active (loại context)
+            if context_text and punct_window.startswith(context_text):
+                active_punc_text = punct_window[len(context_text):].strip()
             else:
-                arr = np.array(block, copy=False)
-                if arr.dtype == np.int16:
-                    arr = arr.astype(np.float32)
+                # fallback: cắt dựa trên số từ context
+                punc_tokens_full = TOKEN_RE.findall(punct_window)
+                raw_context_word_count = len(WORD_RE.findall(context_text))
+                active_punc_text = " ".join(punc_tokens_full[raw_context_word_count:])
+
+            if not active_punc_text.strip():
+                return
+
+            punct_tokens_active = TOKEN_RE.findall(active_punc_text)
+
+            # 5. Logic chọn lượng commit
+            commit_k_punc_tokens = 0
+            found_sentence_end = False
+
+            margin_check_word_idx = len(tail_raw_words) - punc_commit_margin_words
+            temp_word_count = 0
+            for i, tok in enumerate(punct_tokens_active):
+                if WORD_RE.fullmatch(tok):
+                    temp_word_count += 1
+                if temp_word_count < margin_check_word_idx and SENT_END_RE.search(tok):
+                    commit_k_punc_tokens = i + 1
+                    found_sentence_end = True
+
+            if force_commit:
+                commit_k_punc_tokens = len(punct_tokens_active)
+            elif not found_sentence_end and len(tail_raw_words) > punc_window_words:
+                # fallback: commit đến trước margin
+                commit_k_raw_words_fallback = len(tail_raw_words) - punc_commit_margin_words
+                temp_word_count = 0
+                for i, tok in enumerate(punct_tokens_active):
+                    if WORD_RE.fullmatch(tok):
+                        temp_word_count += 1
+                    if temp_word_count >= commit_k_raw_words_fallback:
+                        commit_k_punc_tokens = i + 1
+                        break
+
+            # 6. Xử lý commit (nếu có)
+            new_commit_text_itn = ""
+            if commit_k_punc_tokens > 0:
+                commit_tokens_punc = punct_tokens_active[:commit_k_punc_tokens]
+                commit_text_punc = " ".join(commit_tokens_punc) + " "
+
+                # đếm số từ thô tương ứng
+                commit_k_raw_words = len(WORD_RE.findall(commit_text_punc))
+
+                # ITN phần commit
+                commit_text_itn = inverse_normalize_local(commit_text_punc).strip()
+                if commit_text_itn:
+                    committed_text_normalized_display = (
+                            committed_text_normalized_display + " " + commit_text_itn
+                    ).strip()
+                    new_commit_text_itn = commit_text_itn
+
+                # cập nhật context punc
+                committed_text_punctuated_context = (
+                        committed_text_punctuated_context + commit_text_punc
+                )[-context_buffer_size:]
+
+                # dịch committed_ptr theo số từ (chống drift)
+                committed_ptr = advance_pointer_by_words(
+                    raw_text, committed_ptr, commit_k_raw_words
+                )
+
+                # phần active còn lại
+                active_tokens_punc = punct_tokens_active[commit_k_punc_tokens:]
+                active_text_punc = " ".join(active_tokens_punc)
+            else:
+                active_text_punc = " ".join(punct_tokens_active)
+
+            # 7. Handle active part (ITN với cache)
+            prefix_display = committed_text_normalized_display
+
+            active_tokens = TOKEN_RE.findall(active_text_punc)
+            margin_tok_count = punc_commit_margin_words
+
+            if active_tokens:
+                if len(active_tokens) > margin_tok_count:
+                    head_punc_toks = active_tokens[:-margin_tok_count]
+                    tail_punc_toks = active_tokens[-margin_tok_count:]
+
+                    head_punc = " ".join(head_punc_toks)
+                    tail_punc = " ".join(tail_punc_toks)
+
+                    if cached_itn_head[0] == head_punc:
+                        head_itn = cached_itn_head[1]
+                    else:
+                        head_itn = inverse_normalize_local(head_punc)
+                        cached_itn_head = (head_punc, head_itn)
+
+                    tail_itn = inverse_normalize_local(tail_punc)
+                    active_itn = (head_itn + " " + tail_itn).strip()
                 else:
-                    arr = arr.astype(np.float32)
-            # mono
-            if arr.ndim > 1:
-                arr = arr.mean(axis=1)
-            # scale giống hàm cũ: fbank(seg * 32768)
-            arr = arr / 32768.0  # chuẩn hóa về [-1,1] nếu cần
-            return arr
+                    active_itn = inverse_normalize_local(active_text_punc)
+            else:
+                active_itn = ""
+
+            display_full = (prefix_display + " " + active_itn).strip()
+
+            # 8. Emit sự kiện
+            if new_commit_text_itn:
+                _emit("commit", {
+                    "new_commit": new_commit_text_itn,
+                    "committed": committed_text_normalized_display,
+                    "display": display_full,
+                })
+
+            _emit("partial", {
+                "display": display_full,
+                "committed": committed_text_normalized_display,
+                "active": active_itn,
+            })
+
+        # ====== MAIN LOOP: đọc mic + ASR + VAD ======
+        final_text = ""
+
+        print("ASR + Punc + ITN realtime. Listening on server mic...")
 
         try:
-            for block in audio_iter:
-                if block is None:
-                    break
+            with sd.InputStream(
+                    samplerate=sr,
+                    channels=1,
+                    dtype="float32",
+                    blocksize=block_samples,
+            ) as stream:
+                while True:
+                    if stop_event is not None and stop_event.is_set():
+                        break
 
-                audio_block = to_float_mono(block)
-                if audio_block.size == 0:
-                    continue
+                    audio_block, _ = stream.read(block_samples)
 
-                # nếu block dài hơn block_samples thì cắt thành các khung
-                start = 0
-                while start < audio_block.size:
-                    end = min(start + block_samples, audio_block.size)
-                    frame = audio_block[start:end]
-                    start = end
+                    # VAD RMS
+                    rms = float(np.sqrt(np.mean(np.square(audio_block)))) if audio_block.size else 0.0
 
-                    # nếu frame nhỏ hơn block_samples, vẫn dùng (được bù bởi lookahead)
-                    q_audio.append(frame.astype(np.float32, copy=True))
+                    force_commit = False
+                    if rms < vad_threshold:
+                        silence_blocks += 1
+                        if silence_blocks > vad_min_silence_blocks:
+                            if was_speaking:
+                                force_commit = True  # chuyển từ nói -> im lặng
+                                was_speaking = False
+                        # nếu im lặng dài, không cần chạy ASR cho block này
+                    else:
+                        silence_blocks = 0
+                        was_speaking = True
 
+                    # nếu block toàn im lặng sau commit, bỏ qua luôn
+                    if rms < vad_threshold and not was_speaking and not force_commit:
+                        continue
+
+                    # ===== ASR chunkformer giống bản cũ =====
+                    q_audio.append(
+                        np.squeeze(audio_block, axis=1).astype(np.float32, copy=True)
+                    )
                     if len(q_audio) < 1 + lookahead_blk:
+                        # chưa đủ lookahead
+                        if force_commit:
+                            run_punc_itn_and_emit(force_commit=True)
                         continue
 
-                    seg_np = np.concatenate(q_audio).astype(np.float32)
+                    seg_np = np.concatenate(list(q_audio), dtype=np.float32)
                     if seg_np.size < int(0.025 * sr):
+                        if force_commit:
+                            run_punc_itn_and_emit(force_commit=True)
                         continue
 
-                    # fbank như cũ
                     seg = torch.from_numpy(seg_np).unsqueeze(0).to(device) * 32768.0
                     x = kaldi.fbank(
                         seg, num_mel_bins=80, frame_length=25, frame_shift=10,
@@ -685,7 +929,10 @@ class ChunkFormer:
                     ).unsqueeze(0).to(device)
                     x_len = torch.tensor([x.size(1)], dtype=torch.int, device=device)
 
-                    with torch.cuda.amp.autocast(dtype=torch.float16):
+                    use_cuda = (device.type == "cuda")
+                    ctx = torch.amp.autocast(device_type='cuda',
+                                             dtype=torch.float16) if use_cuda else contextlib.nullcontext()
+                    with ctx:
                         enc_out, enc_len, _, att_cache, cnn_cache, offset = \
                             self.model.encoder.forward_parallel_chunk(
                                 xs=x,
@@ -707,42 +954,59 @@ class ChunkFormer:
 
                         hyp_step = self.model.encoder.ctc_forward(enc_out).squeeze(0).cpu()
 
-                    seg_start_ms = int(produced_steps * subsampling * 10)
-                    seg_end_ms = int((produced_steps + hyp_step.numel()) * subsampling * 10)
-                    produced_steps += hyp_step.numel()
-
                     chunk_text = get_output([hyp_step], self.char_dict)[0]
-                    ovl = longest_suffix_prefix_overlap(full_hyp, chunk_text, max_k=max_overlap_match)
-                    new_piece = chunk_text[ovl:] if ovl < len(chunk_text) else ""
+                    ovl = longest_suffix_prefix_overlap(raw_text, chunk_text, max_k=max_overlap_match)
+                    if ovl < len(chunk_text):
+                        raw_text = raw_text + chunk_text[ovl:]
 
-                    if new_piece.strip():
-                        full_hyp += new_piece
-                        cleaned = new_piece.strip()
-                        transcript_parts.append(cleaned)
-                        payload = {"start": seg_start_ms, "end": seg_end_ms, "text": cleaned}
-                        _emit("commit", payload, " ".join(transcript_parts).strip())
+                    # chỉ gọi pipeline khi raw thay đổi hoặc force_commit
+                    if raw_text != last_raw_sent or force_commit:
+                        last_raw_sent = raw_text
+                        run_punc_itn_and_emit(force_commit=force_commit)
 
                     # trượt cửa sổ
                     if q_audio:
                         q_audio.popleft()
 
-                    torch.cuda.empty_cache()
-
+        except KeyboardInterrupt:
+            pass
+        except Exception as e:
+            print(f"[ASR] error: {e}", flush=True)
         finally:
-            # flush nốt
-            full_now = " ".join(transcript_parts).strip()
-            if full_hyp.strip() and full_now != full_hyp.strip():
-                remaining = full_hyp[len(full_now):].strip()
-                if remaining:
-                    transcript_parts.append(remaining)
-                    payload = {"start": 0, "end": 0, "text": remaining}
-                    _emit("final_flush", payload, " ".join(transcript_parts).strip())
+            # Flush tail giống logic main mới
+            if punc_model is not None:
+                tail_raw = raw_text[committed_ptr:]
+                if tail_raw.strip():
+                    try:
+                        context_text = committed_text_punctuated_context[-context_buffer_size:]
+                        final_raw_with_context = (context_text + " " + tail_raw).strip()
+                        final_punc_full = punc_model.infer([final_raw_with_context])[0]
+
+                        if context_text and final_punc_full.startswith(context_text):
+                            final_punc_text = final_punc_full[len(context_text):].strip()
+                        else:
+                            final_punc_text = tail_raw
+
+                        final_itn_text = inverse_normalize_local(final_punc_text).strip()
+
+                        if committed_text_normalized_display:
+                            final_text = (committed_text_normalized_display + " " + final_itn_text).strip()
+                        else:
+                            final_text = final_itn_text
+                    except Exception as e:
+                        print(f"[FINAL PUNC/ITN] error: {e}", flush=True)
+                        final_text = (committed_text_normalized_display + " " + tail_raw).strip()
+                else:
+                    final_text = committed_text_normalized_display.strip()
             else:
-                # emit final_flush trống cho rõ vòng đời
-                _emit("final_flush", {"start": 0, "end": 0, "text": ""}, full_now)
+                # không punc/itn
+                final_text = raw_text.strip()
 
-        return " ".join(transcript_parts).strip() if return_final else ""
+            _emit("final_flush", {"text": final_text})
 
+            if return_final:
+                return final_text
+            return ""
 
     def run_chunkformer_stt(self,audio_path):
         cmd = [

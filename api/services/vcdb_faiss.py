@@ -33,7 +33,7 @@ class VectorStore:
             self.bm25_retriever.k = 25
         except:
             self.db = None
-            self.retriever = None
+            self.cosine_retriever = None
             self.bm25_retriever = None
 
     def hybrid_search(self, question):
