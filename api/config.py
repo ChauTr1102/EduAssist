@@ -82,7 +82,7 @@ Gắn nhãn rõ ràng (**Nếu có**) như: Mục đích, Ý chính, Quyết đ�
 SEARCH_KWARGS = {'k': 25, 'score_threshold': 0.01, 'sorted': True}
 SEARCH_TYPE = "similarity_score_threshold"
 
-VECTOR_DATABASE = "./vectorstores/"
+VECTOR_DATABASE = "../api/vectorstores/"
 
 SYSTEM_DOCUMENT = "./data/data_system"
 USER_DOCUMENT = "./data/data_user"

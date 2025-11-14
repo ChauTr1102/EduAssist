@@ -588,8 +588,7 @@ class ChunkFormer:
 
                                 # Punctuation
                                 punc_model=None, use_sbd: bool = False, punc_window_words: int = 240,
-                                punc_commit_margin_words: int = 120, punc_processing_window_words: int = 400,
-                                punc_context_overlap_words: int = 3,
+                                punc_commit_margin_words: int = 120,
 
                                 # ITN
                                 itn_classifier=None, itn_verbalizer=None,
