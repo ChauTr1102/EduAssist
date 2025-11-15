@@ -31,7 +31,8 @@ class VectorStore:
             documents = list(self.db.docstore._dict.values())
             self.bm25_retriever = BM25Retriever.from_documents(documents)
             self.bm25_retriever.k = 25
-        except:
+        except Exception as e:
+            print(f"Can't Load VectorDB: {e}")
             self.db = None
             self.cosine_retriever = None
             self.bm25_retriever = None

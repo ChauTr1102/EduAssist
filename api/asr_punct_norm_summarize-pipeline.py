@@ -30,7 +30,7 @@ llm = LanguageModelOllama("shmily_006/Qw3:4b_4bit", temperature=0.5)
 # shmily_006/Qw3:4b_4bit
 # hf.co/bartowski/Meta-Llama-3.1-8B-Instruct-GGUF:q4_K_M
 
-faiss = VectorStore("Baocaouyvienbochinhtri")
+faiss = VectorStore("luat_hon_nhan_gia_dinh")
 
 ## Punct model dùng CPU
 punct_model = PunctCapSegModelONNX.from_pretrained("1-800-BAD-CODE/xlm-roberta_punctuation_fullstop_truecase",
