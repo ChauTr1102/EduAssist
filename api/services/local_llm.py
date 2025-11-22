@@ -97,6 +97,9 @@ class LanguageModelOllama:
             "stream": False,  # non-stream để trả về trọn gói
             "think": False,
             "temperature": self.temperature,
+            "options": {
+                "num_ctx": 8192
+            }
         }
 
         last_exc = None
