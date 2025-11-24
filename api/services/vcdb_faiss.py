@@ -18,12 +18,12 @@ import tiktoken
 from api.utils.raw_utterances_processing import *
 
 class VectorStore:
-    def __init__(self, meeting_id: str):
+    def __init__(self, meeting_id: str, model_embedding):
         self.text_splitter = RecursiveCharacterTextSplitter(chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP,
                                                             length_function=len)
         # self.model_embedding = GoogleGenerativeAIEmbeddings(model=MODEL_EMBEDDING, google_api_key=openai_embedding_key)
         self.meeting_id = meeting_id
-        self.model_embedding = HuggingFaceEmbeddings(model_name=MODEL_EMBEDDING, model_kwargs={"trust_remote_code": True})
+        self.model_embedding = model_embedding
         try:
             self.db = FAISS.load_local(f'{VECTOR_DATABASE}/{meeting_id}', self.model_embedding,
                                        allow_dangerous_deserialization=True)

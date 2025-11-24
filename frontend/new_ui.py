@@ -17,6 +17,7 @@ from api.private_config import *
 from api.config import *          # để lấy SUMMARIZE_DOCUMENT_PROMPT, v.v.
 from api.services.vcdb_faiss import VectorStore
 from api.services.local_llm import LanguageModelOllama  # bản đã có async_generate
+from langchain_huggingface.embeddings import HuggingFaceEmbeddings
 
 warnings.filterwarnings("ignore")
 
@@ -59,13 +60,24 @@ itn_classifier, itn_verbalizer = init_itn_model(ITN_REPO)
 
 # ---- RAG / LLM từ luồng cũ ----
 llm = LanguageModelOllama("shmily_006/Qw3:4b_4bit", temperature=0.5)
-faiss = VectorStore("luat_hon_nhan_gia_dinh")
+model_embedding = HuggingFaceEmbeddings(model_name=MODEL_EMBEDDING, model_kwargs={"trust_remote_code": True})
+faiss = VectorStore("luat_hon_nhan_gia_dinh/documents", model_embedding)
+transcript_faiss = VectorStore("luat_hon_nhan_gia_dinh/transcripts", model_embedding)
+meeting_document_summarize = """LUẬT HÔN NHÂN VÀ GIA ĐÌNH: Luật này quy định chế độ hôn nhân và gia đình; chuẩn mực pháp lý cho cách ứng xử giữa các thành viên
+gia đình; trách nhiệm của cá nhân, tổ chức, Nhà nước và xã hội trong việc xây dựng, củng cố chế độ hôn
+nhân và gia đình."""
 
 # =========================
 # RAG QUEUES & GLOBALS (luồng cũ)
 # =========================
 job_queue = Queue(maxsize=0)
 summarizer_queue = Queue(maxsize=0)
+
+# =========================
+# EMBEDDING QUEUE & LOCK (FAISS)
+# =========================
+embedding_queue = Queue(maxsize=0)
+faiss_lock = threading.Lock()
 
 # =========================
 # ASYNC EVENT LOOP THREAD (luồng cũ)
@@ -137,7 +149,7 @@ def worker_loop(worker_id: int):
 
         try:
             # 1) Chuẩn hoá bằng async_generate (non-stream) chạy trên loop nền
-            normalize_prompt = llm.normalize_text(text)
+            normalize_prompt = llm.normalize_text(meeting_document_summarize, text)
             normalized = run_async(llm.async_generate(normalize_prompt), timeout=60.0)
             print(f"[Worker-{worker_id}] Câu đã được chuẩn hóa và tối ưu:", text, "\n", normalized)
             print("___________________________________________________________________________________________________________")
@@ -164,6 +176,51 @@ def start_workers(num_workers: int = 2):
     for i in range(num_workers):
         t = threading.Thread(target=worker_loop, args=(i+1,), daemon=True)
         t.start()
+
+# =========================
+# EMBEDDING WORKER (FAISS)
+# =========================
+def embedding_worker():
+    """
+    Worker chuyên nhận text từ embedding_queue và nhét vào FAISS.
+    Dùng VectorStore.add_transcript(transcript, start, end).
+    Hiện tại chưa có timestamp -> tạm dùng start/end = 0.0
+    hoặc sau này bạn truyền timestamp thực vào.
+    """
+    print("[EmbeddingWorker] Starting")
+    while True:
+        try:
+            text = embedding_queue.get(timeout=1.0)
+        except Empty:
+            continue
+
+        try:
+            clean_text = (text or "").strip()
+            if not clean_text:
+                continue
+
+            # Ở đây bạn có thể tính start/end real nếu có,
+            # tạm thời truyền 0.0 / 0.0 cho đơn giản.
+            start = 0.0
+            end = 0.0
+
+            with faiss_lock:
+                # faiss là instance VectorStore(...) global bạn đã tạo
+                transcript_faiss.add_transcript(clean_text, start, end)
+
+            print("[EmbeddingWorker] Added transcript chunk to FAISS:", clean_text[:80], "...")
+        except Exception as e:
+            print(f"[EmbeddingWorker] ERROR: {e}")
+        finally:
+            try:
+                embedding_queue.task_done()
+            except Exception:
+                pass
+
+
+def start_embedding_worker():
+    t = threading.Thread(target=embedding_worker, daemon=True)
+    t.start()
 
 # =========================
 # SUMMARIZER LOOP (song song, luồng cũ)
@@ -216,6 +273,7 @@ def start_summarizer():
 # Khởi động workers & summarizer
 start_workers(num_workers=2)
 start_summarizer()
+start_embedding_worker()
 
 
 # =========================
@@ -224,11 +282,13 @@ start_summarizer()
 def enqueue_rag_with_overlap(new_commit: str):
     """
     Gom 2 new_commit from asr lại với nhau (cửa sổ trượt size=2, overlap=1),
-    sau đó mới đẩy vào job_queue.
+    sau đó đẩy vào:
+      - job_queue (RAG + summarize)
+      - embedding_queue (FAISS embedding)
 
     Ví dụ:
       commits: A, B, C, D
-      gửi vào RAG: (A+B), (B+C), (C+D)
+      gửi vào cả 2 queue: (A+B), (B+C), (C+D)
     """
     global rag_buffer
 
@@ -240,20 +300,28 @@ def enqueue_rag_with_overlap(new_commit: str):
         # Thêm commit mới vào buffer
         rag_buffer.append(new_commit)
 
-        # Chưa đủ 2 câu thì chưa gửi vào RAG
+        # Chưa đủ 2 câu thì chưa gửi
         if len(rag_buffer) < 2:
             return
 
         # Đủ 2 câu: gom lại thành 1 đoạn
         combined = rag_buffer[0] + " " + rag_buffer[1]
 
+        # Đẩy vào RAG
         try:
             job_queue.put_nowait(combined)
         except Exception as e:
-            print(f"[enqueue_rag_with_overlap] Cannot enqueue combined text: {e}")
+            print(f"[enqueue_rag_with_overlap] Cannot enqueue combined text to job_queue: {e}")
+
+        # Đẩy vào embedding FAISS
+        try:
+            embedding_queue.put_nowait(combined)
+        except Exception as e:
+            print(f"[enqueue_rag_with_overlap] Cannot enqueue combined text to embedding_queue: {e}")
 
         # Giữ overlap = 1: giữ lại câu cuối cùng để ghép với commit tiếp theo
         rag_buffer = [rag_buffer[-1]]
+
 
 
 def on_update(event: str, payload: dict):
