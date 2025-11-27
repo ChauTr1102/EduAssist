@@ -61,8 +61,11 @@ itn_classifier, itn_verbalizer = init_itn_model(ITN_REPO)
 # ---- RAG / LLM từ luồng cũ ----
 llm = LanguageModelOllama("shmily_006/Qw3:4b_4bit", temperature=0.5)
 model_embedding = HuggingFaceEmbeddings(model_name=MODEL_EMBEDDING, model_kwargs={"trust_remote_code": True})
+
 faiss = VectorStore("luat_hon_nhan_gia_dinh/documents", model_embedding)
 transcript_faiss = VectorStore("luat_hon_nhan_gia_dinh/transcripts", model_embedding)
+cache_faiss = VectorStore("luat_hon_nhan_gia_dinh/cache", model_embedding)
+
 meeting_document_summarize = """LUẬT HÔN NHÂN VÀ GIA ĐÌNH: Luật này quy định chế độ hôn nhân và gia đình; chuẩn mực pháp lý cho cách ứng xử giữa các thành viên
 gia đình; trách nhiệm của cá nhân, tổ chức, Nhà nước và xã hội trong việc xây dựng, củng cố chế độ hôn
 nhân và gia đình."""
@@ -156,16 +159,24 @@ def worker_loop(worker_id: int):
 
             if not normalized or normalized.strip().casefold() == "none":
                 continue
-            else:
-                # 2) Retrieve tài liệu liên quan
-                related_docs = faiss.hybrid_search(normalized)
 
-                # 3) Đẩy sang summarizer_queue để tóm tắt song song
-                summarizer_queue.put({
-                    "utterance": normalized,
-                    "related_docs": related_docs,
-                    "ts": time.time()
-                })
+            # Check cache: đã xử lý chưa? ---
+            if cache_faiss.is_already_retrieved(normalized, similarity_threshold=0.7):
+                print(f"[Worker-{worker_id}] Skipped cached text: {normalized}")
+                continue
+
+            # 2) Retrieve tài liệu liên quan
+            related_docs = faiss.hybrid_search(normalized)
+
+            # 3) Đẩy sang summarizer_queue để tóm tắt song song
+            summarizer_queue.put({
+                "utterance": normalized,
+                "related_docs": related_docs,
+                "ts": time.time()
+            })
+
+            with faiss_lock:
+                cache_faiss.add_cache(normalized)
 
         except Exception as e:
             print(f"[Worker-{worker_id}] ERROR processing job: {e}")
@@ -466,17 +477,50 @@ def poll_ui():
 # =========================
 def chat_qa(history, message):
     """
-    Handler tạm thời cho chatbot.
-    Backend RAG hỏi đáp sẽ thay thế logic này sau.
+    Chatbot tạm thời, dùng llm.async_generate để nói chuyện bình thường.
+    - history: list[(user, assistant)]
+    - message: câu hỏi mới từ người dùng
     """
     if not message:
         return history, ""
-    response = (
-        "Chức năng hỏi đáp Chatbot về cuộc họp chưa hoàn thiện.\n"
-        f"Bạn vừa hỏi: {message}"
-    )
-    history = history + [(message, response)]
-    return history, ""
+
+    # Build context từ history (nếu có)
+    history = history or []
+    history_str_parts = []
+    for u, a in history:
+        history_str_parts.append(f"Người dùng: {u}\nTrợ lý: {a}")
+    history_str = "\n\n".join(history_str_parts)
+
+    # Prompt đơn giản để test hội thoại bình thường
+    if history_str:
+        prompt = (
+            "Bạn là một trợ lý nói chuyện tự nhiên bằng tiếng Việt.\n"
+            "Dưới đây là lịch sử cuộc hội thoại cho đến hiện tại:\n\n"
+            f"{history_str}\n\n"
+            f"Người dùng: {message}\n"
+            "Trợ lý: "
+        )
+    else:
+        prompt = (
+            "Bạn là một trợ lý nói chuyện tự nhiên bằng tiếng Việt.\n"
+            f"Người dùng: {message}\n"
+            "Trợ lý: "
+        )
+
+    try:
+        # Gọi LLM async_generate trên event loop nền
+        reply = run_async(llm.async_generate(prompt), timeout=60.0)
+        reply = (reply or "").strip()
+        if not reply:
+            reply = "Mình đang gặp chút trục trặc nên chưa trả lời được câu này 😅."
+    except Exception as e:
+        print(f"[Chatbot] ERROR: {e}")
+        reply = "Chatbot đang gặp lỗi nội bộ, bạn thử hỏi lại sau một chút nhé."
+
+    # Cập nhật history cho Chatbot (format list[(user, assistant)])
+    new_history = history + [(message, reply)]
+    return new_history, ""  # clear ô input
+
 
 
 # =========================

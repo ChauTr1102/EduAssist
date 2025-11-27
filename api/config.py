@@ -36,7 +36,7 @@ Lời nói: "Chị ơi, trưa nay ăn gì không?"
 Lời nói: "Quy định mới yêu cầu nhân viên đăng ký làm việc từ xa trước 2 ngày."
 -> Quy định đăng ký làm việc từ xa
 
-4. Tóm tắt tài liệu: Luật này quy định chế độ hôn nhân và gia đình; chuẩn mực pháp lý cho cách ứng xử giữa các thành viên gia đình; trách nhiệm của cá nhân, tổ chức, Nhà nước và xã hội trong việc xây dựng, củng cố chế độ hôn nhân và gia đình.
+4. Tóm tắt tài liệu: Luật hôn nhân và gia đình.
 Lời Nói: "Và nội dung xác định tài sản chung, tài sản riêng của vợ chồng trong video ngày hôm nay sẽ được áp dụng theo chế độ tài sản luật định nha mọi người"
 -> Xác định tài sản chung, tài sản riêng của vợ chồng theo chế độ tài sản luật định
 
