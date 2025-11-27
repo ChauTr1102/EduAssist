@@ -18,12 +18,12 @@ import tiktoken
 from api.utils.raw_utterances_processing import *
 
 class VectorStore:
-    def __init__(self, meeting_id: str):
+    def __init__(self, meeting_id: str, model_embedding):
         self.text_splitter = RecursiveCharacterTextSplitter(chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP,
                                                             length_function=len)
         # self.model_embedding = GoogleGenerativeAIEmbeddings(model=MODEL_EMBEDDING, google_api_key=openai_embedding_key)
         self.meeting_id = meeting_id
-        self.model_embedding = HuggingFaceEmbeddings(model_name=MODEL_EMBEDDING, model_kwargs={"trust_remote_code": True})
+        self.model_embedding = model_embedding
         try:
             self.db = FAISS.load_local(f'{VECTOR_DATABASE}/{meeting_id}', self.model_embedding,
                                        allow_dangerous_deserialization=True)
@@ -128,17 +128,17 @@ class VectorStore:
         db = FAISS.from_documents(chunks, self.model_embedding)
         return db
 
-    def faiss_save_local(self, db):
-        db.save_local(f'{VECTOR_DATABASE}/{self.meeting_id}')
+    def faiss_save_local(self, db, type_id):
+        db.save_local(f'{VECTOR_DATABASE}/{self.meeting_id}/{type_id}')
 
     # thêm vào vectorstore
-    def merge_to_vectorstore(self, old_db, new_db, meeting_id):
+    def merge_to_vectorstore(self, old_db, new_db, meeting_id, type_id):
         old_db.merge_from(new_db)
-        old_db.save_local(f'{VECTOR_DATABASE}/{meeting_id}')
+        old_db.save_local(f'{VECTOR_DATABASE}/{meeting_id}/{type_id}')
         return old_db
 
     # xóa khỏi vectorstore theo id của chunks
-    def delete_from_vectorstore(self, file_name, meeting_id):
+    def delete_from_vectorstore(self, file_name, meeting_id, type_id):
         # db_user, retriever_user = self.check_user_db(user_id)
         db_user = self.db
         docstore = db_user.docstore._dict
@@ -147,9 +147,7 @@ class VectorStore:
             if values.metadata['source'].endswith(f"{file_name}"):
                 key_delete.append(key)
         db_user.delete(key_delete)
-        db_user.save_local(f"{VECTOR_DATABASE}/{meeting_id}")
-        # os.remove(f"{USER_DOCUMENT}")
-        # sql_conn.delete_file(file_name, folder_id)
+        db_user.save_local(f"{VECTOR_DATABASE}/{meeting_id}/{type_id}")
 
     def add_transcript(self, transcript, start, end):
         idx = len(self.db.docstore._dict) if self.db is not None else 0
@@ -157,12 +155,59 @@ class VectorStore:
         # bỏ vào vectorstore mới
         new_db = self.create_vectorstore(chunks)
         if self.db is not None: # Nếu đã có db, hợp nhất db cũ với db mới
-            self.db = self.merge_to_vectorstore(self.db, new_db, self.meeting_id)
+            self.db = self.merge_to_vectorstore(self.db, new_db, self.meeting_id, "transcripts")
             return None
         else:  # Nếu chưa có db
-            new_db.save_local(f'{VECTOR_DATABASE}/{self.meeting_id}')
+            new_db.save_local(f'{VECTOR_DATABASE}/{self.meeting_id}/transcripts')
             self.db = new_db
             return None
+
+    def add_cache(self, transcript):
+        chunk = cache_documenting(transcript)
+        # bỏ vào vectorstore mới
+        new_db = self.create_vectorstore([chunk])
+        if self.db is not None: # Nếu đã có db, hợp nhất db cũ với db mới
+            self.db = self.merge_to_vectorstore(self.db, new_db, self.meeting_id, "cache")
+            return None
+        else:  # Nếu chưa có db
+            new_db.save_local(f'{VECTOR_DATABASE}/{self.meeting_id}/cache')
+            self.db = new_db
+            return None
+
+    # --- 2. Hàm kiểm tra novelty / trùng lặp ---
+    def is_already_retrieved(self, text: str, top_k: int = 1, similarity_threshold: float = None) -> bool:
+        """
+        Kiểm tra xem text (đã được normalize / clean) đã từng được embed + lưu trong cache_faiss hay chưa.
+        Tuỳ thuộc metric (L2 distance hoặc cosine), dùng threshold phù hợp:
+          - Nếu cache dùng L2 distance: distance <= distance_threshold → coi là trùng.
+          - Nếu cache dùng cosine similarity: score >= similarity_threshold → coi là trùng.
+        """
+        text = text.strip()
+        if not text:
+            return False
+
+        # Search nearest in cache
+        if self.db is None:
+            self.add_cache(text)
+            return False
+
+        try:
+            results = self.db.similarity_search_with_relevance_scores(text, k=top_k)
+        except Exception as e:
+            print(f"[cache check] error in similarity_search_with_score: {e}")
+            return False
+
+        if not results:
+            return False
+
+        # results: list of (Document, score_or_distance)
+        doc, score = results[0]
+
+        if score >= similarity_threshold:
+            return True
+
+        # Nếu không xác định threshold → luôn coi là “chưa xử lý”
+        return False
 
     # # upload file và lưu vào vectorstore faiss, lưu file vào folder của conversation_id
     # def upload_file(self, file: UploadFile = File(...), user_id: str = Form(...), folder_id: str = Form(...),

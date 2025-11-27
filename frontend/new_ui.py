@@ -17,12 +17,14 @@ from api.private_config import *
 from api.config import *          # để lấy SUMMARIZE_DOCUMENT_PROMPT, v.v.
 from api.services.vcdb_faiss import VectorStore
 from api.services.local_llm import LanguageModelOllama  # bản đã có async_generate
+from langchain_huggingface.embeddings import HuggingFaceEmbeddings
 
 warnings.filterwarnings("ignore")
 
 # =========================
 # ITN MODEL
 # =========================
+
 def init_itn_model(itn_model_dir: str):
     print(f"Loading ITN model from: {itn_model_dir}")
     far_dir = os.path.join(itn_model_dir, "far")
@@ -48,6 +50,7 @@ def init_itn_model(itn_model_dir: str):
 # =========================
 # INIT GLOBAL MODELS
 # =========================
+
 chunkformer = ChunkFormer(model_checkpoint=CHUNKFORMER_CHECKPOINT)
 punc_model = PunctCapSegModelONNX.from_pretrained(
     "1-800-BAD-CODE/xlm-roberta_punctuation_fullstop_truecase",
@@ -57,13 +60,27 @@ itn_classifier, itn_verbalizer = init_itn_model(ITN_REPO)
 
 # ---- RAG / LLM từ luồng cũ ----
 llm = LanguageModelOllama("shmily_006/Qw3:4b_4bit", temperature=0.5)
-faiss = VectorStore("luat_hon_nhan_gia_dinh")
+model_embedding = HuggingFaceEmbeddings(model_name=MODEL_EMBEDDING, model_kwargs={"trust_remote_code": True})
+
+faiss = VectorStore("luat_hon_nhan_gia_dinh/documents", model_embedding)
+transcript_faiss = VectorStore("luat_hon_nhan_gia_dinh/transcripts", model_embedding)
+cache_faiss = VectorStore("luat_hon_nhan_gia_dinh/cache", model_embedding)
+
+meeting_document_summarize = """LUẬT HÔN NHÂN VÀ GIA ĐÌNH: Luật này quy định chế độ hôn nhân và gia đình; chuẩn mực pháp lý cho cách ứng xử giữa các thành viên
+gia đình; trách nhiệm của cá nhân, tổ chức, Nhà nước và xã hội trong việc xây dựng, củng cố chế độ hôn
+nhân và gia đình."""
 
 # =========================
 # RAG QUEUES & GLOBALS (luồng cũ)
 # =========================
 job_queue = Queue(maxsize=0)
 summarizer_queue = Queue(maxsize=0)
+
+# =========================
+# EMBEDDING QUEUE & LOCK (FAISS)
+# =========================
+embedding_queue = Queue(maxsize=0)
+faiss_lock = threading.Lock()
 
 # =========================
 # ASYNC EVENT LOOP THREAD (luồng cũ)
@@ -118,6 +135,9 @@ commit_log = ""        # log new_commit (backend dùng nếu cần)
 summary_lock = threading.Lock()
 summary_text = ""      # cột phải: summarize docs / tóm tắt
 
+# buffer để gom new_commit trước khi đẩy sang RAG
+rag_buffer = []
+rag_buffer_lock = threading.Lock()
 
 # =========================
 # WORKER CHÍNH CHO RAG (luồng cũ)
@@ -132,23 +152,31 @@ def worker_loop(worker_id: int):
 
         try:
             # 1) Chuẩn hoá bằng async_generate (non-stream) chạy trên loop nền
-            normalize_prompt = llm.normalize_text(text)
+            normalize_prompt = llm.normalize_text(meeting_document_summarize, text)
             normalized = run_async(llm.async_generate(normalize_prompt), timeout=60.0)
-            print(f"[Worker-{worker_id}] Câu đã được chuẩn hóa và tối ưu:", normalized)
+            print(f"[Worker-{worker_id}] Câu đã được chuẩn hóa và tối ưu:", text, "\n", normalized)
             print("___________________________________________________________________________________________________________")
 
             if not normalized or normalized.strip().casefold() == "none":
                 continue
-            else:
-                # 2) Retrieve tài liệu liên quan
-                related_docs = faiss.hybrid_search(normalized)
 
-                # 3) Đẩy sang summarizer_queue để tóm tắt song song
-                summarizer_queue.put({
-                    "utterance": normalized,
-                    "related_docs": related_docs,
-                    "ts": time.time()
-                })
+            # Check cache: đã xử lý chưa? ---
+            if cache_faiss.is_already_retrieved(normalized, similarity_threshold=0.7):
+                print(f"[Worker-{worker_id}] Skipped cached text: {normalized}")
+                continue
+
+            # 2) Retrieve tài liệu liên quan
+            related_docs = faiss.hybrid_search(normalized)
+
+            # 3) Đẩy sang summarizer_queue để tóm tắt song song
+            summarizer_queue.put({
+                "utterance": normalized,
+                "related_docs": related_docs,
+                "ts": time.time()
+            })
+
+            with faiss_lock:
+                cache_faiss.add_cache(normalized)
 
         except Exception as e:
             print(f"[Worker-{worker_id}] ERROR processing job: {e}")
@@ -159,6 +187,51 @@ def start_workers(num_workers: int = 2):
     for i in range(num_workers):
         t = threading.Thread(target=worker_loop, args=(i+1,), daemon=True)
         t.start()
+
+# =========================
+# EMBEDDING WORKER (FAISS)
+# =========================
+def embedding_worker():
+    """
+    Worker chuyên nhận text từ embedding_queue và nhét vào FAISS.
+    Dùng VectorStore.add_transcript(transcript, start, end).
+    Hiện tại chưa có timestamp -> tạm dùng start/end = 0.0
+    hoặc sau này bạn truyền timestamp thực vào.
+    """
+    print("[EmbeddingWorker] Starting")
+    while True:
+        try:
+            text = embedding_queue.get(timeout=1.0)
+        except Empty:
+            continue
+
+        try:
+            clean_text = (text or "").strip()
+            if not clean_text:
+                continue
+
+            # Ở đây bạn có thể tính start/end real nếu có,
+            # tạm thời truyền 0.0 / 0.0 cho đơn giản.
+            start = 0.0
+            end = 0.0
+
+            with faiss_lock:
+                # faiss là instance VectorStore(...) global bạn đã tạo
+                transcript_faiss.add_transcript(clean_text, start, end)
+
+            print("[EmbeddingWorker] Added transcript chunk to FAISS:", clean_text[:80], "...")
+        except Exception as e:
+            print(f"[EmbeddingWorker] ERROR: {e}")
+        finally:
+            try:
+                embedding_queue.task_done()
+            except Exception:
+                pass
+
+
+def start_embedding_worker():
+    t = threading.Thread(target=embedding_worker, daemon=True)
+    t.start()
 
 # =========================
 # SUMMARIZER LOOP (song song, luồng cũ)
@@ -185,7 +258,7 @@ def summarizer_loop():
                 if summary_text:
                     summary_text = (
                         summary_text
-                        + "\n\n================= NEW SUMMARY =================\n"
+                        + "\n\n────────  NEW SUMMARY  ────────\n"
                         + summary.strip()
                     )
                 else:
@@ -211,11 +284,57 @@ def start_summarizer():
 # Khởi động workers & summarizer
 start_workers(num_workers=2)
 start_summarizer()
+start_embedding_worker()
 
 
 # =========================
 # CALLBACK FROM CHUNKFORMER (luồng mới + RAG)
 # =========================
+def enqueue_rag_with_overlap(new_commit: str):
+    """
+    Gom 2 new_commit from asr lại với nhau (cửa sổ trượt size=2, overlap=1),
+    sau đó đẩy vào:
+      - job_queue (RAG + summarize)
+      - embedding_queue (FAISS embedding)
+
+    Ví dụ:
+      commits: A, B, C, D
+      gửi vào cả 2 queue: (A+B), (B+C), (C+D)
+    """
+    global rag_buffer
+
+    new_commit = (new_commit or "").strip()
+    if not new_commit:
+        return
+
+    with rag_buffer_lock:
+        # Thêm commit mới vào buffer
+        rag_buffer.append(new_commit)
+
+        # Chưa đủ 2 câu thì chưa gửi
+        if len(rag_buffer) < 2:
+            return
+
+        # Đủ 2 câu: gom lại thành 1 đoạn
+        combined = rag_buffer[0] + " " + rag_buffer[1]
+
+        # Đẩy vào RAG
+        try:
+            job_queue.put_nowait(combined)
+        except Exception as e:
+            print(f"[enqueue_rag_with_overlap] Cannot enqueue combined text to job_queue: {e}")
+
+        # Đẩy vào embedding FAISS
+        try:
+            embedding_queue.put_nowait(combined)
+        except Exception as e:
+            print(f"[enqueue_rag_with_overlap] Cannot enqueue combined text to embedding_queue: {e}")
+
+        # Giữ overlap = 1: giữ lại câu cuối cùng để ghép với commit tiếp theo
+        rag_buffer = [rag_buffer[-1]]
+
+
+
 def on_update(event: str, payload: dict):
     """
     Callback từ chunkformer_asr_realtime_punc_norm:
@@ -226,12 +345,6 @@ def on_update(event: str, payload: dict):
             payload: {"new_commit", "committed", "display"}
       - event = "final_flush":
             payload: {"text"}
-
-    Dùng cho 2 việc:
-      1) Cập nhật UI (transcript_text).
-      2) Đẩy dữ liệu sang RAG:
-         - commit: đưa payload["new_commit"] vào job_queue
-         - final_flush: (tuỳ chọn) đưa text cuối cùng vào job_queue
     """
     global transcript_text, commit_log
 
@@ -248,32 +361,25 @@ def on_update(event: str, payload: dict):
                        or "").strip()
             if display:
                 transcript_text = display
-
-            # Lấy new_commit để log (backend) + đẩy vào RAG
+            # Lấy new_commit để log (backend) + gom vào chunk 2-câu trước khi đẩy sang RAG
             new_commit = (payload.get("new_commit") or "").strip()
             if new_commit:
-                # log commit nếu cần
                 if commit_log:
                     commit_log_val = f"{commit_log}\n{new_commit}"
                 else:
                     commit_log_val = new_commit
                 commit_log = commit_log_val
 
-                # Đưa từng new_commit sang RAG pipeline
-                try:
-                    job_queue.put_nowait(new_commit)
-                except Exception as e:
-                    print(f"[on_update] Cannot enqueue new_commit to job_queue: {e}")
+                enqueue_rag_with_overlap(new_commit)
 
         elif event == "final_flush":
             text = (payload.get("text") or "").strip()
             if text:
                 transcript_text = text
-                # (tuỳ chọn) cũng có thể đưa full text cuối vào RAG
-                try:
-                    job_queue.put_nowait(text)
-                except Exception as e:
-                    print(f"[on_update] Cannot enqueue final text to job_queue: {e}")
+                # try:
+                #     job_queue.put_nowait(text)
+                # except Exception as e:
+                #     print(f"[on_update] Cannot enqueue final text to job_queue: {e}")
 
 
 # =========================
@@ -334,17 +440,16 @@ def start_asr():
         t = threading.Thread(target=asr_worker, daemon=True)
         t.start()
         asr_thread = t
-        # reset transcript & summary
         return (
             gr.update(value=""),  # transcript_box
             gr.update(value=""),  # summary_box
-            "ASR started ✅ (listening on server mic)",  # status
+            "Đang lắng nghe 🎧",   # status
         )
     else:
         return (
-            gr.update(),          # transcript_box (không đổi)
-            gr.update(),          # summary_box (không đổi)
-            "ASR is already running",
+            gr.update(),          # transcript_box
+            gr.update(),          # summary_box
+            "ASR đã chạy rồi ✅",
         )
 
 
@@ -353,15 +458,12 @@ def stop_asr():
     Stop button: set stop_event, worker sẽ tự thoát vòng while.
     """
     stop_event.set()
-    return "Stop signal sent ⏹️"
+    return "Đã gửi tín hiệu dừng ⏹️"
 
 
 def poll_ui():
     """
     Được gọi bởi gr.Timer để cập nhật UI định kỳ.
-    Trả về:
-      - transcript_text (cột trái)
-      - summary_text (cột phải)
     """
     with transcript_lock:
         txt = transcript_text
@@ -375,70 +477,105 @@ def poll_ui():
 # =========================
 def chat_qa(history, message):
     """
-    Handler tạm thời cho chatbot.
-    Backend RAG hỏi đáp sẽ thay thế logic này sau.
+    Chatbot tạm thời, dùng llm.async_generate để nói chuyện bình thường.
+    - history: list[(user, assistant)]
+    - message: câu hỏi mới từ người dùng
     """
     if not message:
         return history, ""
-    # Placeholder: chỉ phản hồi thông báo, sau này bạn nối với backend RAG theo ý muốn.
-    response = (
-        "Chức năng hỏi đáp về cuộc họp sẽ được backend xử lý sau.\n"
-        f"Bạn vừa hỏi: {message}"
-    )
-    history = history + [(message, response)]
-    return history, ""
+
+    # Build context từ history (nếu có)
+    history = history or []
+    history_str_parts = []
+    for u, a in history:
+        history_str_parts.append(f"Người dùng: {u}\nTrợ lý: {a}")
+    history_str = "\n\n".join(history_str_parts)
+
+    # Prompt đơn giản để test hội thoại bình thường
+    if history_str:
+        prompt = (
+            "Bạn là một trợ lý nói chuyện tự nhiên bằng tiếng Việt.\n"
+            "Dưới đây là lịch sử cuộc hội thoại cho đến hiện tại:\n\n"
+            f"{history_str}\n\n"
+            f"Người dùng: {message}\n"
+            "Trợ lý: "
+        )
+    else:
+        prompt = (
+            "Bạn là một trợ lý nói chuyện tự nhiên bằng tiếng Việt.\n"
+            f"Người dùng: {message}\n"
+            "Trợ lý: "
+        )
+
+    try:
+        # Gọi LLM async_generate trên event loop nền
+        reply = run_async(llm.async_generate(prompt), timeout=60.0)
+        reply = (reply or "").strip()
+        if not reply:
+            reply = "Mình đang gặp chút trục trặc nên chưa trả lời được câu này 😅."
+    except Exception as e:
+        print(f"[Chatbot] ERROR: {e}")
+        reply = "Chatbot đang gặp lỗi nội bộ, bạn thử hỏi lại sau một chút nhé."
+
+    # Cập nhật history cho Chatbot (format list[(user, assistant)])
+    new_history = history + [(message, reply)]
+    return new_history, ""  # clear ô input
+
 
 
 # =========================
-# BUILD UI (3 cột)
+# BUILD UI (3 cột, tối giản & full-height)
 # =========================
+
 with gr.Blocks() as demo:
-    gr.Markdown(
-        "## 🎧 Realtime ASR + Punc + ITN + RAG (Server Mic)\n"
-        "- Dùng microphone trên **server** (sounddevice).\n"
-        "- ChunkFormer streaming + VAD + Punctuation + Inverse Text Normalization.\n"
-        "- Tự động gửi các đoạn `new_commit` sang pipeline RAG + tóm tắt.\n"
-        "- Chatbot hỏi đáp về cuộc họp (backend sẽ xử lý sau).\n"
-    )
+    gr.Markdown("### 📝 Realtime Meeting Assistant")
 
+    # Hàng nút điều khiển
     with gr.Row():
-        start_btn = gr.Button("▶️ Start", variant="primary")
-        stop_btn = gr.Button("⏹️ Stop", variant="stop")
-
-    status = gr.Markdown("Idle")
-
-    # Ba cột:
-    #   - Cột trái: transcript
-    #   - Cột giữa (scale=2): chatbot
-    #   - Cột phải: summaries / retrieved docs
-    with gr.Row():
-        # Cột trái
         with gr.Column(scale=1):
+            start_btn = gr.Button("▶️ Bắt đầu ghi âm", variant="primary")
+        with gr.Column(scale=1):
+            stop_btn = gr.Button("⏹️ Dừng", variant="secondary")
+        with gr.Column(scale=1):
+            status = gr.Markdown("Đang idle…")
+
+    # Ba cột chính
+    with gr.Row(elem_classes=["main-row"]):
+        # Cột trái: Transcript
+        with gr.Column(scale=2, elem_classes=["main-col"]):
+            gr.Markdown("**Transcript cuộc họp**")
             transcript_box = gr.Textbox(
-                label="Transcript (Punctuated + Normalized)",
-                lines=20,
+                show_label=False,
+                placeholder="Transcript",
+                lines=37,
                 interactive=False,
+                elem_classes=["full-height-box"],
             )
 
-        # Cột giữa (chatbot)
-        with gr.Column(scale=2):
+        # Cột giữa: Chatbot
+        with gr.Column(scale=3, elem_classes=["main-col"]):
+            gr.Markdown("**Chatbot hỏi đáp về cuộc họp**")
             chatbot = gr.Chatbot(
-                label="Meeting Assistant (Q&A về cuộc họp)",
-                height=400,
+                label="",
+                elem_classes=["full-height-chatbot"], resizable=True, height=680
             )
+            # Ô nhập + nút gửi nhỏ nằm trong Textbox (submit_btn)
             chat_input = gr.Textbox(
-                label="Câu hỏi của bạn về cuộc họp",
+                show_label=False,
+                placeholder="Đặt câu hỏi về nội dung cuộc họp...",
                 lines=2,
-                placeholder="Ví dụ: Cuộc họp vừa rồi kết luận gì về quyền nuôi con?",
+                submit_btn=True,   # nút gửi nhỏ ở trong textbox
             )
-            send_btn = gr.Button("Gửi câu hỏi")
 
-        # Cột phải
-        with gr.Column(scale=1):
+        # Cột phải: Summaries / Docs
+        with gr.Column(scale=2, elem_classes=["main-col"]):
+            gr.Markdown("**Tóm tắt & tài liệu liên quan**")
             summary_box = gr.Textbox(
-                label="Summaries / Retrieved Docs",
-                lines=20,
+                show_label=False,
+                placeholder="Các đoạn tóm tắt từ RAG sẽ hiển thị tại đây...",
+                lines=37,
                 interactive=False,
+                elem_classes=["full-height-box"],
             )
 
     # Start: reset + chạy thread ASR
@@ -453,19 +590,14 @@ with gr.Blocks() as demo:
         outputs=[status],
     )
 
-    # Timer: gọi poll_ui định kỳ để sync transcript & summary
+    # Timer: cập nhật transcript & summary
     timer = gr.Timer(value=0.25, active=True)
     timer.tick(
         fn=poll_ui,
         outputs=[transcript_box, summary_box],
     )
 
-    # Wiring chatbot (tạm thời)
-    send_btn.click(
-        fn=chat_qa,
-        inputs=[chatbot, chat_input],
-        outputs=[chatbot, chat_input],
-    )
+    # Chatbot wiring: chỉ dùng submit của Textbox
     chat_input.submit(
         fn=chat_qa,
         inputs=[chatbot, chat_input],
@@ -474,5 +606,4 @@ with gr.Blocks() as demo:
 
 if __name__ == "__main__":
     demo.launch(server_name="0.0.0.0", server_port=7860)
-    # (tuỳ chọn) khi kết thúc toàn app:
     # stop_async_loop()

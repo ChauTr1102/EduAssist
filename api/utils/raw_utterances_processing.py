@@ -121,3 +121,6 @@ def utterances_to_documents_no_speakers(transcript, start, end, idx) -> Document
     }
 
     return Document(page_content=transcript, metadata=metadata)
+
+def cache_documenting(normalized_text) -> Document:
+    return Document(page_content=normalized_text)

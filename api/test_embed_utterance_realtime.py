@@ -5,7 +5,7 @@ from collections import deque
 from punctuators.models import PunctCapSegModelONNX
 
 chunkformer = ChunkFormer(model_checkpoint=CHUNKFORMER_CHECKPOINT)
-# faiss = VectorStore("hop_nextstart")
+faiss = VectorStore("hop_nextstart")
 punct_model = PunctCapSegModelONNX.from_pretrained("1-800-BAD-CODE/xlm-roberta_punctuation_fullstop_truecase")
 buffer = deque()
 

@@ -56,8 +56,8 @@ class LanguageModelOllama:
     """
         return prompt
 
-    def normalize_text(self, sentence: str):
-        prompt = NORMALIZE_PROMPT.format(text=sentence)
+    def normalize_text(self, meeting_document_summarize: str, transcript: str):
+        prompt = NORMALIZE_PROMPT.format(meeting_document_summarize=meeting_document_summarize, text=transcript)
         return prompt
 
     # async def generate(self, prompt: str):
@@ -97,6 +97,9 @@ class LanguageModelOllama:
             "stream": False,  # non-stream để trả về trọn gói
             "think": False,
             "temperature": self.temperature,
+            "options": {
+                "num_ctx": 8192
+            }
         }
 
         last_exc = None
