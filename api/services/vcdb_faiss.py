@@ -132,9 +132,9 @@ class VectorStore:
         db.save_local(f'{VECTOR_DATABASE}/{self.meeting_id}/{type_id}')
 
     # thêm vào vectorstore
-    def merge_to_vectorstore(self, old_db, new_db, meeting_id, type_id):
+    def merge_to_vectorstore(self, old_db, new_db, meeting_id):
         old_db.merge_from(new_db)
-        old_db.save_local(f'{VECTOR_DATABASE}/{meeting_id}/{type_id}')
+        old_db.save_local(f'{VECTOR_DATABASE}/{meeting_id}')
         return old_db
 
     # xóa khỏi vectorstore theo id của chunks
@@ -155,10 +155,10 @@ class VectorStore:
         # bỏ vào vectorstore mới
         new_db = self.create_vectorstore(chunks)
         if self.db is not None: # Nếu đã có db, hợp nhất db cũ với db mới
-            self.db = self.merge_to_vectorstore(self.db, new_db, self.meeting_id, "transcripts")
+            self.db = self.merge_to_vectorstore(self.db, new_db, self.meeting_id)
             return None
         else:  # Nếu chưa có db
-            new_db.save_local(f'{VECTOR_DATABASE}/{self.meeting_id}/transcripts')
+            new_db.save_local(f'{VECTOR_DATABASE}/{self.meeting_id}')
             self.db = new_db
             return None
 
@@ -167,10 +167,10 @@ class VectorStore:
         # bỏ vào vectorstore mới
         new_db = self.create_vectorstore([chunk])
         if self.db is not None: # Nếu đã có db, hợp nhất db cũ với db mới
-            self.db = self.merge_to_vectorstore(self.db, new_db, self.meeting_id, "cache")
+            self.db = self.merge_to_vectorstore(self.db, new_db, self.meeting_id)
             return None
         else:  # Nếu chưa có db
-            new_db.save_local(f'{VECTOR_DATABASE}/{self.meeting_id}/cache')
+            new_db.save_local(f'{VECTOR_DATABASE}/{self.meeting_id}')
             self.db = new_db
             return None
 

@@ -17,6 +17,7 @@ from api.private_config import *
 from api.config import *          # để lấy SUMMARIZE_DOCUMENT_PROMPT, v.v.
 from api.services.vcdb_faiss import VectorStore
 from api.services.local_llm import LanguageModelOllama  # bản đã có async_generate
+from api.services.rag_processor import RagProcessor
 from langchain_huggingface.embeddings import HuggingFaceEmbeddings
 
 warnings.filterwarnings("ignore")
@@ -136,8 +137,17 @@ summary_lock = threading.Lock()
 summary_text = ""      # cột phải: summarize docs / tóm tắt
 
 # buffer để gom new_commit trước khi đẩy sang RAG
-rag_buffer = []
-rag_buffer_lock = threading.Lock()
+# rag_buffer = []
+# rag_buffer_lock = threading.Lock()
+
+rag_processor = RagProcessor(
+    job_queue=job_queue,
+    embedding_queue=embedding_queue,
+    n_commits_to_combine=3,   # số commit gom thành 1 chunk
+    overlap_m=1,              # overlap giữa các chunk
+    timeout_sec=15.0,          # im lặng 15s thì flush mớ còn lại
+    on_emit=None,             # hoặc truyền callback để debug nếu thích
+)
 
 # =========================
 # WORKER CHÍNH CHO RAG (luồng cũ)
@@ -290,51 +300,6 @@ start_embedding_worker()
 # =========================
 # CALLBACK FROM CHUNKFORMER (luồng mới + RAG)
 # =========================
-def enqueue_rag_with_overlap(new_commit: str):
-    """
-    Gom 2 new_commit from asr lại với nhau (cửa sổ trượt size=2, overlap=1),
-    sau đó đẩy vào:
-      - job_queue (RAG + summarize)
-      - embedding_queue (FAISS embedding)
-
-    Ví dụ:
-      commits: A, B, C, D
-      gửi vào cả 2 queue: (A+B), (B+C), (C+D)
-    """
-    global rag_buffer
-
-    new_commit = (new_commit or "").strip()
-    if not new_commit:
-        return
-
-    with rag_buffer_lock:
-        # Thêm commit mới vào buffer
-        rag_buffer.append(new_commit)
-
-        # Chưa đủ 2 câu thì chưa gửi
-        if len(rag_buffer) < 2:
-            return
-
-        # Đủ 2 câu: gom lại thành 1 đoạn
-        combined = rag_buffer[0] + " " + rag_buffer[1]
-
-        # Đẩy vào RAG
-        try:
-            job_queue.put_nowait(combined)
-        except Exception as e:
-            print(f"[enqueue_rag_with_overlap] Cannot enqueue combined text to job_queue: {e}")
-
-        # Đẩy vào embedding FAISS
-        try:
-            embedding_queue.put_nowait(combined)
-        except Exception as e:
-            print(f"[enqueue_rag_with_overlap] Cannot enqueue combined text to embedding_queue: {e}")
-
-        # Giữ overlap = 1: giữ lại câu cuối cùng để ghép với commit tiếp theo
-        rag_buffer = [rag_buffer[-1]]
-
-
-
 def on_update(event: str, payload: dict):
     """
     Callback từ chunkformer_asr_realtime_punc_norm:
@@ -370,12 +335,15 @@ def on_update(event: str, payload: dict):
                     commit_log_val = new_commit
                 commit_log = commit_log_val
 
-                enqueue_rag_with_overlap(new_commit)
+                # enqueue_rag_with_overlap(new_commit, 3, 1)
+                rag_processor.process_new_commit(new_commit)
 
         elif event == "final_flush":
             text = (payload.get("text") or "").strip()
             if text:
                 transcript_text = text
+
+            rag_processor.flush_all(reason="final_flush")
                 # try:
                 #     job_queue.put_nowait(text)
                 # except Exception as e:
@@ -458,6 +426,7 @@ def stop_asr():
     Stop button: set stop_event, worker sẽ tự thoát vòng while.
     """
     stop_event.set()
+    rag_processor.flush_all(reason="stop_button")
     return "Đã gửi tín hiệu dừng ⏹️"
 
 
