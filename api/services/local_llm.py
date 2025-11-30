@@ -3,6 +3,7 @@ import httpx
 import requests
 from typing import AsyncGenerator, Dict, Optional
 from api.services import *
+import json
 
 class LanguageModelOllama:
     def __init__(self, model: str, stream: bool = False, temperature: float = 0.7,
@@ -56,18 +57,38 @@ class LanguageModelOllama:
     """
         return prompt
 
+    async def reformulate_question(self, question, history, meeting_document_summarize):
+        reformulate_prompt = (REGENERATE_QUESTION_PROMPT + "\n" + f"Lịch sử cuộc hội thoại: \n {history}\n\n" +
+                              f"Tóm tắt nội dung cuộc họp: \n {meeting_document_summarize}\n\n" +
+                              f"Câu hỏi của người dùng: {question}")
+
+        response = await self.async_generate(reformulate_prompt)
+        data = json.loads(response)
+        return data
+
+    async def normal_qa_handler(self, question, history, meeting_document_summarize):
+        reformulate_prompt = (NORMAL_QA_PROMPT + "\n" + f"### Lịch sử cuộc hội thoại: \n {history}\n\n" +
+                              f"### Tóm tắt nội dung cuộc họp: \n {meeting_document_summarize}\n\n" +
+                              f"### Câu hỏi của người dùng: {question}")
+        response = await self.async_generate(reformulate_prompt)
+        return response
+
+    async def rag_qa_handler(self, question, history, meeting_document_summarize, related_docs, related_transcript):
+        reformulate_prompt = (RAG_PROMPT + "\n" + f"### Lịch sử cuộc hội thoại: \n {history}\n\n" +
+                              f"### Tóm tắt nội dung cuộc họp: \n {meeting_document_summarize}\n\n" +
+                              f"### Tài liệu liên quan: \n {related_docs}\n\n" +
+                              f"### Bản ghi cuộc họp liên quan: \n {related_transcript}\n\n" +
+                              f"### Câu hỏi của người dùng: {question}")
+        response = await self.async_generate(reformulate_prompt)
+        return response
+
     def normalize_text(self, meeting_document_summarize: str, transcript: str):
         prompt = NORMALIZE_PROMPT.format(meeting_document_summarize=meeting_document_summarize, text=transcript)
         return prompt
 
-    # async def generate(self, prompt: str):
-    #     async with httpx.AsyncClient() as client:
-    #         response = await client.post(self._endpoint(),
-    #                                      json={"model": self.model, "prompt": prompt, "stream": self.stream,
-    #                                            "think": False},
-    #                                      timeout=60.0)
-    #     return response.json()["response"]
-
+    # ---------------------------
+    # Send message
+    # ---------------------------
     def generate(self, prompt: str) -> str:
         """Hàm đồng bộ: gửi yêu cầu tới server và trả về kết quả."""
         # Sử dụng sync Client
@@ -98,7 +119,7 @@ class LanguageModelOllama:
             "think": False,
             "temperature": self.temperature,
             "options": {
-                "num_ctx": 8192
+                "num_ctx": 7000
             }
         }
 
@@ -114,3 +135,7 @@ class LanguageModelOllama:
                 continue
         if last_exc:
             raise last_exc
+
+    # ---------------------------
+    # Input Handler
+    # ---------------------------

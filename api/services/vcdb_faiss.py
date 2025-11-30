@@ -37,11 +37,11 @@ class VectorStore:
             self.cosine_retriever = None
             self.bm25_retriever = None
 
-    def hybrid_search(self, question):
+    async def hybrid_search(self, question):
         ensemble_retriever = EnsembleRetriever(retrievers=[self.bm25_retriever, self.cosine_retriever],
                                                weights=[0.5, 0.5])
 
-        compressed_docs = ensemble_retriever.invoke(question)
+        compressed_docs = await ensemble_retriever.ainvoke(question)
         content_text = "\n\n---\n\n".join([doc.page_content for doc in compressed_docs[:4]])
         return content_text
 
@@ -156,10 +156,21 @@ class VectorStore:
         new_db = self.create_vectorstore(chunks)
         if self.db is not None: # Nếu đã có db, hợp nhất db cũ với db mới
             self.db = self.merge_to_vectorstore(self.db, new_db, self.meeting_id)
+
+            # Cập nhật retriever
+            self.cosine_retriever = self.db.as_retriever(search_kwargs=SEARCH_KWARGS, search_type=SEARCH_TYPE)
+            documents = list(self.db.docstore._dict.values())
+            self.bm25_retriever = BM25Retriever.from_documents(documents)
+            self.bm25_retriever.k = 25
             return None
         else:  # Nếu chưa có db
             new_db.save_local(f'{VECTOR_DATABASE}/{self.meeting_id}')
             self.db = new_db
+            # Cập nhật retriever
+            self.cosine_retriever = self.db.as_retriever(search_kwargs=SEARCH_KWARGS, search_type=SEARCH_TYPE)
+            documents = list(self.db.docstore._dict.values())
+            self.bm25_retriever = BM25Retriever.from_documents(documents)
+            self.bm25_retriever.k = 25
             return None
 
     def add_cache(self, transcript):
@@ -178,9 +189,8 @@ class VectorStore:
     def is_already_retrieved(self, text: str, top_k: int = 1, similarity_threshold: float = None) -> bool:
         """
         Kiểm tra xem text (đã được normalize / clean) đã từng được embed + lưu trong cache_faiss hay chưa.
-        Tuỳ thuộc metric (L2 distance hoặc cosine), dùng threshold phù hợp:
-          - Nếu cache dùng L2 distance: distance <= distance_threshold → coi là trùng.
-          - Nếu cache dùng cosine similarity: score >= similarity_threshold → coi là trùng.
+        Dùng threshold phù hợp:
+          - Cosine similarity: score >= similarity_threshold → coi là trùng.
         """
         text = text.strip()
         if not text:
