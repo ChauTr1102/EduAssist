@@ -2,6 +2,7 @@ import re
 from typing import List, Optional
 from pydantic import BaseModel
 from langchain_core.documents import Document
+from api.utils.time_format import ms_to_hms_pad
 
 TIME_RE = re.compile(r"(?P<start>\d{2}:\d{2}\.\d{3})\s*-->\s*(?P<end>\d{2}:\d{2}\.\d{3})")
 SPEAKER_RE = re.compile(r"^\[(?P<spk>[^\]]+)\]\s*:\s*(?P<text>.*)$")
@@ -113,8 +114,8 @@ def utterances_to_documents(utterances: List[Utterance],
 def utterances_to_documents_no_speakers(transcript, start, end, idx) -> Document:
     metadata = {
         "speaker": "UNKNOWN",
-        "start_seconds": start,
-        "end_seconds": end,
+        "start_seconds": ms_to_hms_pad(start),
+        "end_seconds": ms_to_hms_pad(end),
         "duration_seconds": round(end - start, 3),
         "turn_id": idx+1,
         "conversation_id": None
