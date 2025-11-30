@@ -16,4 +16,3 @@ def inverse_normalize(s: str, verbose=False) -> str:
 		print(token)
 	return top_rewrite(token, verbalizer)
 
-
