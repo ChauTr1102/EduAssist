@@ -61,26 +61,75 @@ class RagProcessor:
                 pass
 
     # ===== Core logic =====
-    def _emit_chunk_locked(self, chunk: str):
+    def _emit_chunk_locked(self, chunk):
         """
         Đẩy 1 chunk vào 2 queue. Gọi hàm này khi đã cầm _lock.
         """
-        chunk = chunk.strip()
-        if not chunk:
+        # if isinstance(chunk, dict):
+        text = chunk.get("text", "").strip()
+        if not text:
             return
+        # else:
+        #     text = (chunk or "").strip()
+        #     if not text:
+        #         return
+        #     chunk = {"text": text}
+        
         try:
-            self.job_queue.put_nowait(chunk)
+            self.job_queue.put_nowait(text)  # job_queue nhận text thôi
         except Exception as e:
             print(f"[RagProcessor] Cannot enqueue chunk to job_queue: {e}")
         try:
-            self.embedding_queue.put_nowait(chunk)
+            self.embedding_queue.put_nowait(chunk)  # embedding_queue nhận dict
         except Exception as e:
             print(f"[RagProcessor] Cannot enqueue chunk to embedding_queue: {e}")
+
+    def _combine_buffer_items(self, items):
+        """
+        Gom các item (có thể là dict hoặc str) trong buffer thành 1 chunk.
+        Nếu đều là dict: lấy start_time_ms từ item đầu, end_time_ms từ item cuối.
+        """
+        texts = []
+
+        for item in items:
+            texts.append(item.get("new_commit", ""))
+
+        start_ms = items[0]["start_time_ms"]
+        end_ms = items[-1]["end_time_ms"]
+        chunk_text = " ".join(texts)
+
+        return {
+            "text": chunk_text,
+            "start_time_ms": start_ms,
+            "end_time_ms": end_ms,
+        }
+
+
+        # for item in items:
+        #     if isinstance(item, dict):
+        #         texts.append(item.get("text", ""))
+        #         if start_ms is None and "start_time_ms" in item:
+        #             start_ms = item["start_time_ms"]
+        #         if "end_time_ms" in item:
+        #             end_ms = item["end_time_ms"]
+        #     else:
+        #         texts.append(str(item))
+        #
+        # chunk_text = " ".join(texts)
+        # if start_ms is not None or end_ms is not None:
+        #     return {
+        #         "text": chunk_text,
+        #         "start_time_ms": start_ms,
+        #         "end_time_ms": end_ms,
+        #     }
+        # return chunk_text
+
 
     def _flush_all_locked(self, reason: str = ""):
         """
         Gom toàn bộ buffer hiện tại thành ít nhất 1 chunk, rồi clear buffer.
         Trả về list chunks đã emit (để log/debug nếu cần).
+        Buffer chứa các item (dict với timestamps).
         """
         with self._lock:
             if not self.buffer:
@@ -90,13 +139,13 @@ class RagProcessor:
 
             if len(self.buffer) <= self.n_commits_to_combine:
                 # ít commit: gom hết thành 1 chunk
-                chunk = " ".join(self.buffer)
+                chunk = self._combine_buffer_items(self.buffer)
                 self._emit_chunk_locked(chunk)
                 chunks.append(chunk)
             else:
                 # nhiều commit: chia thành các block size = n_commits_to_combine (không overlap)
                 for i in range(0, len(self.buffer), self.n_commits_to_combine):
-                    chunk = " ".join(self.buffer[i:i + self.n_commits_to_combine])
+                    chunk = self._combine_buffer_items(self.buffer[i:i + self.n_commits_to_combine])
                     self._emit_chunk_locked(chunk)
                     chunks.append(chunk)
 
@@ -105,22 +154,24 @@ class RagProcessor:
 
             return chunks
 
-    def process_new_commit(self, new_commit: str):
+    def process_new_commit(self, new_commit):
         """
         Gọi hàm này mỗi khi có new_commit từ on_update(event="commit").
         Áp dụng sliding window + timer như PunctProcessor.
         """
-        new_commit = (new_commit or "").strip()
-        if not new_commit:
-            return
+        # Lưu full item (có timestamps nếu có)
+        if isinstance(new_commit, dict):
+            item_to_buffer = new_commit
+        else:
+            item_to_buffer = new_commit
 
         with self._lock:
-            self.buffer.append(new_commit)
+            self.buffer.append(item_to_buffer)
 
             # Nếu đủ n_commit => tạo 1 chunk (có overlap) và emit ngay
             if len(self.buffer) >= self.n_commits_to_combine:
                 # lấy n commit gần nhất làm chunk
-                chunk = " ".join(self.buffer[-self.n_commits_to_combine:])
+                chunk = self._combine_buffer_items(self.buffer[-self.n_commits_to_combine:])
                 self._emit_chunk_locked(chunk)
 
                 # giữ overlap_m commit cuối lại, bỏ phần còn lại

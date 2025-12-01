@@ -175,8 +175,8 @@ def worker_loop(worker_id: int):
                 print(f"[Worker-{worker_id}] Skipped cached text: {normalized}")
                 continue
 
-            # 2) Retrieve tài liệu liên quan
-            related_docs = faiss.hybrid_search(normalized)
+            # 2) Retrieve tài liệu liên quan (async → dùng run_async)
+            related_docs = run_async(faiss.hybrid_search(normalized), timeout=60.0)
 
             # 3) Đẩy sang summarizer_queue để tóm tắt song song
             summarizer_queue.put({
@@ -203,33 +203,36 @@ def start_workers(num_workers: int = 2):
 # =========================
 def embedding_worker():
     """
-    Worker chuyên nhận text từ embedding_queue và nhét vào FAISS.
-    Dùng VectorStore.add_transcript(transcript, start, end).
-    Hiện tại chưa có timestamp -> tạm dùng start/end = 0.0
-    hoặc sau này bạn truyền timestamp thực vào.
+    Worker chuyên nhận item từ embedding_queue và nhét vào FAISS.
+    Item có thể là str hoặc dict {"text": ..., "start_time_ms": ..., "end_time_ms": ...}
+    Dùng VectorStore.add_transcript(transcript, start, end, metadata).
     """
     print("[EmbeddingWorker] Starting")
     while True:
         try:
-            text = embedding_queue.get(timeout=1.0)
+            item = embedding_queue.get(timeout=1.0)
         except Empty:
             continue
 
         try:
-            clean_text = (text or "").strip()
+            # Extract text và timestamps từ item
+            if isinstance(item, dict):
+                clean_text = (item.get("text") or "").strip()
+                start_ms = item.get("start_time_ms")
+                end_ms = item.get("end_time_ms")
+            else:
+                clean_text = (item or "").strip()
+                start_ms = 0
+                end_ms = 0
+
             if not clean_text:
                 continue
 
-            # Ở đây bạn có thể tính start/end real nếu có,
-            # tạm thời truyền 0.0 / 0.0 cho đơn giản.
-            start = 0.0
-            end = 0.0
-
             with faiss_lock:
-                # faiss là instance VectorStore(...) global bạn đã tạo
-                transcript_faiss.add_transcript(clean_text, start, end)
+                transcript_faiss.add_transcript(clean_text, start_ms, end_ms)
 
-            print("[EmbeddingWorker] Added transcript chunk to FAISS:", clean_text[:80], "...")
+            print("[EmbeddingWorker] Added transcript chunk to FAISS:", clean_text[:80],
+                  f"start={start_ms}ms, end={end_ms}ms", "...")
         except Exception as e:
             print(f"[EmbeddingWorker] ERROR: {e}")
         finally:
@@ -336,7 +339,7 @@ def on_update(event: str, payload: dict):
                 commit_log = commit_log_val
 
                 # enqueue_rag_with_overlap(new_commit, 3, 1)
-                rag_processor.process_new_commit(new_commit)
+                rag_processor.process_new_commit(payload)
 
         elif event == "final_flush":
             text = (payload.get("text") or "").strip()
@@ -456,30 +459,31 @@ def chat_qa(history, message):
     # Build context từ history (nếu có)
     history = history or []
     history_str_parts = []
-    for u, a in history:
-        history_str_parts.append(f"Người dùng: {u}\nTrợ lý: {a}")
+    for u, a in history[-3:]:
+        history_str_parts.append(f"User: {u}\nAI: {a}")
     history_str = "\n\n".join(history_str_parts)
 
-    # Prompt đơn giản để test hội thoại bình thường
-    if history_str:
-        prompt = (
-            "Bạn là một trợ lý nói chuyện tự nhiên bằng tiếng Việt.\n"
-            "Dưới đây là lịch sử cuộc hội thoại cho đến hiện tại:\n\n"
-            f"{history_str}\n\n"
-            f"Người dùng: {message}\n"
-            "Trợ lý: "
-        )
-    else:
-        prompt = (
-            "Bạn là một trợ lý nói chuyện tự nhiên bằng tiếng Việt.\n"
-            f"Người dùng: {message}\n"
-            "Trợ lý: "
-        )
-
+    reformulated_question = run_async(llm.reformulate_question(message, history_str, meeting_document_summarize), timeout=60.0)
+    print(reformulated_question)
     try:
-        # Gọi LLM async_generate trên event loop nền
-        reply = run_async(llm.async_generate(prompt), timeout=60.0)
-        reply = (reply or "").strip()
+        if reformulated_question["type"] == 0:
+            reply = run_async(llm.normal_qa_handler(reformulated_question["new_question"], history_str, meeting_document_summarize))
+
+        else:
+            related_docs = run_async(faiss.hybrid_search(reformulated_question["new_question"]),
+                                        timeout=60.0)
+            if transcript_faiss.db is not None:
+                related_transcript = run_async(transcript_faiss.hybrid_search(reformulated_question["new_question"]),
+                                            timeout=60.0)
+                print("transcript db OK!")
+            else:
+                related_transcript = ""
+                print("transcript db is None!")
+
+            reply = run_async(llm.rag_qa_handler(reformulated_question["new_question"], history_str, meeting_document_summarize,
+                                                 related_docs, related_transcript), timeout=60.0)
+
+
         if not reply:
             reply = "Mình đang gặp chút trục trặc nên chưa trả lời được câu này 😅."
     except Exception as e:
