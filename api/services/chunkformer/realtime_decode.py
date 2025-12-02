@@ -43,9 +43,10 @@ YELLOW = colorama.Fore.YELLOW
 BLUE   = colorama.Fore.BLUE
 
 # ===== Regex & helpers =====
-WORD_RE     = re.compile(r"[0-9A-Za-zÀ-Ỵà-ỵ]+")
-_TOKEN_RE   = re.compile(r"\S+")
-END_SENT_RE = re.compile(r"[\.!\?…]\s*$", re.UNICODE)
+WORD_RE       = re.compile(r"[0-9A-Za-zÀ-Ỵà-ỵ]+")
+_TOKEN_RE     = re.compile(r"\S+")
+END_SENT_RE   = re.compile(r"[\.!\?…]\s*$", re.UNICODE)
+SENT_PUNCT_RE = re.compile(r"[\.!\?…]")
 
 # numeric heuristics để bắt các pattern ITN sai kiểu "Ba nghìn 721"
 NUM_TOKEN_RE = re.compile(r"^[0-9]+([.,][0-9]+)*$")
@@ -122,6 +123,40 @@ def longest_suffix_prefix_overlap(a: str, b: str, max_k: int = 32) -> int:
         if a.endswith(b[:L]):
             return L
     return 0
+
+
+def split_commit_region(punct_text: str, window_words: int, margin_words: int):
+    """
+    Tách text sau khi punctuation thành 2 phần:
+    - prefix commit: kết thúc tại dấu câu cuối cùng sao cho vẫn còn >= margin_words ở phía sau.
+    - suffix active: phần còn lại, sẽ tiếp tục được sửa dấu/ITN ở các bước sau.
+
+    Điều kiện kích hoạt commit: tổng số từ > window_words.
+    Như vậy vùng active luôn bắt đầu ngay sau dấu câu gần nhất, tránh phá ngữ nghĩa.
+    """
+    punct_text = punct_text.strip()
+    if not punct_text:
+        return "", ""
+
+    tokens = WORD_RE.findall(punct_text)
+    if len(tokens) <= window_words:
+        # chưa đủ dài để commit, giữ nguyên
+        return "", punct_text
+
+    boundary_idx = None
+    for m in SENT_PUNCT_RE.finditer(punct_text):
+        idx = m.end()
+        remaining_words = len(WORD_RE.findall(punct_text[idx:]))
+        if remaining_words >= margin_words:
+            boundary_idx = idx
+
+    if boundary_idx is None:
+        # không có dấu câu nào phù hợp để cắt, giữ nguyên
+        return "", punct_text
+
+    commit_prefix = punct_text[:boundary_idx]
+    active_text   = punct_text[boundary_idx:]
+    return commit_prefix, active_text
 
 
 # ===== ASR worker =====
@@ -333,7 +368,7 @@ def main():
     ap.add_argument("--right_context_size", type=int, default=32)
     ap.add_argument("--cpu_threads", type=int, default=1)
 
-    # Punctuation (giữ gần logic gốc)
+    # Punctuation
     pp = parser.add_argument_group("Punctuation")
     pp.add_argument("--punc_model", type=str,
                     default="1-800-BAD-CODE/xlm-roberta_punctuation_fullstop_truecase")
@@ -389,7 +424,7 @@ def main():
                 continue
             raw_text = latest
 
-            # tail chưa commit
+            # ====== tail chưa commit trong raw_text ======
             tail_raw = raw_text[committed_ptr:]
             if not tail_raw.strip():
                 continue
@@ -398,57 +433,42 @@ def main():
             if not tokens_tail:
                 continue
 
-            # ====== PUNCT LOGIC: giống bản gốc ======
-            N = args.punc_processing_window_words
-            if committed_ptr == 0:
-                K = 0
-            else:
-                K = args.punc_context_overlap_words
+            # (tuỳ chọn) giới hạn độ dài đầu vào punctuation nếu muốn
+            if len(tokens_tail) > args.punc_processing_window_words:
+                # Trong thực tế, đoạn tail kể từ dấu câu gần nhất thường không quá dài.
+                # Nếu quá dài, vẫn gửi toàn bộ cho model – ưu tiên đúng ngữ nghĩa hơn.
+                pass
 
-            context_tokens = _TOKEN_RE.findall(committed_raw.strip())[-K:] \
-                if K > 0 and committed_raw.strip() else []
-            window_tokens = context_tokens + tokens_tail[-N:]
-            processing_window_raw = " ".join(window_tokens)
+            # ====== PUNCT + COMMIT CĂN THEO CÂU ======
+            punct_tail = punc_model.infer([tail_raw],
+                                          apply_sbd=args.use_sbd)[0]
 
-            punct_window = punc_model.infer([processing_window_raw],
-                                            apply_sbd=args.use_sbd)[0]
-            punct_tokens_full = _TOKEN_RE.findall(punct_window)
+            commit_prefix, active_raw = split_commit_region(
+                punct_tail,
+                window_words=args.punc_window_words,
+                margin_words=args.punc_commit_margin_words
+            )
 
-            actual_k = len(context_tokens)
-            if actual_k > 0 and len(punct_tokens_full) > actual_k:
-                punct_tokens = punct_tokens_full[actual_k:]
-            else:
-                punct_tokens = punct_tokens_full
+            # commit các câu đã đóng (kết thúc bằng .!?…)
+            if commit_prefix:
+                committed_raw += commit_prefix
 
-            # commit theo window_words & commit_margin_words
-            if len(punct_tokens) > args.punc_window_words:
-                commit_k = len(punct_tokens) - args.punc_commit_margin_words
-                commit_chunk_raw = " ".join(punct_tokens[:commit_k]) + " "
-                active_raw = " ".join(punct_tokens[commit_k:])
+                commit_word_count = len(WORD_RE.findall(commit_prefix))
+                committed_ptr = advance_pointer_by_words(
+                    raw_text, committed_ptr, commit_word_count
+                )
 
-                # 1) update committed_raw
-                committed_raw += commit_chunk_raw
-
-                # 2) ITN-safe cho chunk mới
-                commit_chunk_raw_stripped = commit_chunk_raw.strip()
-                commit_chunk_norm = safe_itn_commit(
-                    commit_chunk_raw_stripped,
+                commit_prefix_stripped = commit_prefix.strip()
+                commit_norm = safe_itn_commit(
+                    commit_prefix_stripped,
                     itn_classifier,
                     itn_verbalizer
                 )
                 if committed_norm and not committed_norm.endswith(" "):
                     committed_norm += " "
-                committed_norm += commit_chunk_norm
+                committed_norm += commit_norm
                 if not committed_norm.endswith(" "):
                     committed_norm += " "
-
-                # 3) update pointer theo số từ THÔ trong commit_chunk_raw
-                commit_word_count = len(WORD_RE.findall(commit_chunk_raw))
-                committed_ptr = advance_pointer_by_words(
-                    raw_text, committed_ptr, commit_word_count
-                )
-            else:
-                active_raw = " ".join(punct_tokens)
 
             # ====== ITN mềm cho vùng active ======
             if active_raw.strip():
@@ -486,40 +506,19 @@ def main():
     finally:
         t.join()
 
-        # ====== FINALIZE: punc+ITN cho phần đuôi ======
+        # ====== FINALIZE: punc+ITN cho phần đuôi còn lại ======
         tail_raw = raw_text[committed_ptr:]
         final_punc_tail = ""
 
         if tail_raw.strip():
             try:
-                tokens_tail = _TOKEN_RE.findall(tail_raw)
-                if tokens_tail:
-                    N = args.punc_processing_window_words
-                    if committed_ptr == 0:
-                        K = 0
-                    else:
-                        K = args.punc_context_overlap_words
-
-                    context_tokens = _TOKEN_RE.findall(committed_raw.strip())[-K:] \
-                        if K > 0 and committed_raw.strip() else []
-                    window_tokens = context_tokens + tokens_tail[-N:]
-                    processing_window_raw = " ".join(window_tokens)
-
-                    final_punc_window = punc_model.infer(
-                        [processing_window_raw],
-                        apply_sbd=args.use_sbd
-                    )[0]
-
-                    punct_tokens_full = _TOKEN_RE.findall(final_punc_window)
-                    actual_k = len(context_tokens)
-                    if actual_k > 0 and len(punct_tokens_full) > actual_k:
-                        punct_tokens_tail = punct_tokens_full[actual_k:]
-                    else:
-                        punct_tokens_tail = punct_tokens_full
-
-                    final_punc_tail = " ".join(punct_tokens_tail)
+                final_punc_tail = punc_model.infer(
+                    [tail_raw],
+                    apply_sbd=args.use_sbd
+                )[0]
             except Exception as e:
                 print(f"\nError final punctuation tail: {e}", file=sys.stderr)
+                final_punc_tail = tail_raw
 
         full_punc_text = (committed_raw + " " + final_punc_tail).strip()
         try:
