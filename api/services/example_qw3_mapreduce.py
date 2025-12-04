@@ -20,7 +20,8 @@ ollama_model = LanguageModelOllamaMapReduce(
 mapreduce_llm = OllamaMapReduceLLM(
         model=ollama_model,
         context_window=4096,  # Điều chỉnh theo model của bạn
-        collapse_threshold=2048
+        collapse_threshold=2048,
+        chunk_overlap=200
     )
 
 with open("/home/bojjoo/Code/EduAssist/test_data/dienvien Cong Ly.txt") as f:

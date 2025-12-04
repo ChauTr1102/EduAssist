@@ -72,6 +72,14 @@ class LanguageModelOllamaMapReduce(LanguageModelOllama):
         """
         model_lower = model_name.lower()
         
+        # Qwen models (bao gồm các finetune như Qw3, Qwen, qwen)
+        if any(name in model_lower for name in ['qwen', 'qw']):
+            # Qwen3 chưa release chính thức, dùng Qwen2.5
+            if 'qwen3' in model_lower or 'qw3' in model_lower:
+                print(f"   ℹ️  {model_name} là Qwen3-based, dùng Qwen3-4B tokenizer")
+                return "Qwen/Qwen3-4B"
+            return "Qwen/Qwen3-4B"
+        
         # Llama models
         if 'llama' in model_lower:
             if 'llama3' in model_lower:
@@ -144,62 +152,328 @@ class LanguageModelOllamaMapReduce(LanguageModelOllama):
         return response
 
 
-# ============= VÍ DỤ SỬ DỤNG =============
+# ============= STRUCTURED INFO PROTOCOL & CONFIDENCE CALIBRATION =============
+
+class ConfidenceCalibrator:
+    """
+    Đánh giá độ tin cậy của câu trả lời dựa trên rationale
+    """
+    def calibrate_score(self, rationale: str) -> int:
+        """
+        Tính điểm confidence từ 0-5 dựa trên rationale
+        
+        Args:
+            rationale: Lý do/giải thích của model
+            
+        Returns:
+            Điểm tin cậy từ 0 (không có thông tin) đến 5 (rất tin cậy)
+        """
+        rationale_lower = rationale.lower()
+        
+        # Không có thông tin
+        if any(phrase in rationale_lower for phrase in [
+            "no relevant information", "no information", "không có thông tin",
+            "không liên quan", "không tìm thấy"
+        ]):
+            return 0
+        
+        # Độ tin cậy cao
+        if any(phrase in rationale_lower for phrase in [
+            "highly supported", "high confidence", "rất chắc chắn",
+            "chắc chắn", "rõ ràng", "được nêu rõ"
+        ]):
+            return 5
+        
+        # Độ tin cậy trung bình
+        if any(phrase in rationale_lower for phrase in [
+            "partially", "medium confidence", "có thể", "có vẻ",
+            "phần nào", "suy luận"
+        ]):
+            return 3
+        
+        # Mặc định: độ tin cậy thấp
+        return 1
+
+
+class StructuredInfoProtocol:
+    """
+    Protocol chuẩn hóa thông tin trả về từ MapReduce
+    Đảm bảo tất cả kết quả tuân theo schema nhất quán
+    """
+    def __init__(self, context_window: int = 4096):
+        self.calibrator = ConfidenceCalibrator()
+        self.context_window = context_window
+    
+    def format_mapped_result(self, result: Dict) -> Dict:
+        """
+        Format kết quả từ map stage theo structured protocol
+        
+        Args:
+            result: Output từ model với keys "text", "answer", "rationale"
+            
+        Returns:
+            Dict theo schema chuẩn với keys:
+            - extracted_info: Thông tin được rút trích
+            - rationale: Lý do/giải thích
+            - answer: Câu trả lời
+            - confidence_score: Điểm tin cậy 0-5
+        """
+        return {
+            "extracted_info": result.get("text", ""),
+            "rationale": result.get("rationale", "Generated response"),
+            "answer": result.get("answer", "NO INFORMATION"),
+            "confidence_score": self.calibrator.calibrate_score(
+                result.get("rationale", "")
+            )
+        }
+    
+    def chunk_text_if_needed(self, text: str, tokenizer) -> list:
+        """
+        Chia text thành chunks nếu vượt quá context window
+        
+        Args:
+            text: Text cần chia
+            tokenizer: Tokenizer để đếm tokens
+            
+        Returns:
+            List of text chunks
+        """
+        tokens = tokenizer.encode(text)
+        if len(tokens) <= self.context_window:
+            return [text]
+        
+        chunks = []
+        for i in range(0, len(tokens), self.context_window):
+            chunk_tokens = tokens[i:i + self.context_window]
+            chunk_text = tokenizer.decode(chunk_tokens, skip_special_tokens=True)
+            chunks.append(chunk_text)
+        
+        return chunks
+    
+    def collapse_results(self, model, group: list, query: str) -> Dict:
+        """
+        Collapse một group các mapped results thành 1 kết quả
+        
+        Args:
+            model: Language model instance
+            group: List các mapped results cần collapse
+            query: Query gốc
+            
+        Returns:
+            Collapsed result theo structured format
+        """
+        # Kết hợp extracted_info từ tất cả items trong group
+        combined_text = " ".join(item["extracted_info"] for item in group)
+        
+        # Nếu quá dài, chunk lại và process từng chunk
+        chunks = self.chunk_text_if_needed(combined_text, model.tokenizer)
+        
+        if len(chunks) > 1:
+            # Recursive processing cho text dài
+            collapsed_text = ""
+            for chunk in chunks:
+                collapse_query = f"{query}\n\nSummarize this information:\n{chunk}"
+                result = model.generate(collapse_query)
+                collapsed_text += result.get("text", "") + " "
+            
+            combined_text = collapsed_text.strip()
+        
+        # Generate final collapsed result
+        final_query = f"{query}\n\nConsolidate the following information:\n{combined_text}"
+        result = model.generate(final_query)
+        
+        # Format theo protocol
+        return self.format_mapped_result(result)
+    
+    def reduce_results(self, model, collapsed_results: list, query: str) -> Dict:
+        """
+        Reduce tất cả collapsed results thành câu trả lời cuối cùng
+        
+        Args:
+            model: Language model instance
+            collapsed_results: List các collapsed results
+            query: Query gốc
+            
+        Returns:
+            Final answer theo structured format
+        """
+        # Kết hợp extracted_info từ tất cả collapsed results
+        combined_text = " ".join(item["extracted_info"] for item in collapsed_results)
+        
+        # Nếu quá dài, chunk và process từng chunk
+        chunks = self.chunk_text_if_needed(combined_text, model.tokenizer)
+        
+        if len(chunks) > 1:
+            # Recursive reduce
+            reduced_text = ""
+            for chunk in chunks:
+                reduce_query = f"{query}\n\nBased on this information:\n{chunk}"
+                result = model.generate(reduce_query)
+                reduced_text += result.get("text", "") + " "
+            
+            final_text = reduced_text.strip()
+        else:
+            final_text = combined_text
+        
+        # Generate final answer
+        final_query = f"{query}\n\nProvide a comprehensive final answer based on:\n{final_text}"
+        result = model.generate(final_query)
+        
+        return {
+            "answer": result.get("answer", ""),
+            "text": result.get("text", ""),
+            "confidence_score": self.calibrator.calibrate_score(
+                result.get("rationale", "")
+            )
+        }
+
+
+# ============= MAPREDUCE IMPLEMENTATION =============
 
 class OllamaMapReduceLLM:
     """
     Custom MapReduce implementation cho Ollama models
-    Khắc phục vấn đề không tương thích với MapReduceLLM gốc (thiết kế cho PyTorch)
+    Tương thích với thư viện llm-mapreduce gốc, bao gồm:
+    - StructuredInfoProtocol: Schema chuẩn cho output
+    - ConfidenceCalibrator: Đánh giá độ tin cậy
+    - Recursive processing: Xử lý đệ quy cho văn bản quá dài
+    - Chunk overlap: Giữ ngữ cảnh giữa các chunks
     """
     
     def __init__(self, model: LanguageModelOllamaMapReduce, context_window: int = 4096, 
-                 collapse_threshold: int = 2048):
+                 collapse_threshold: int = 2048, chunk_overlap: int = 200):
         """
         Args:
             model: Instance của LanguageModelOllamaMapReduce
             context_window: Kích thước context window
             collapse_threshold: Ngưỡng để collapse chunks
+            chunk_overlap: Số tokens overlap giữa các chunks (default: 200 tokens ~10%)
+                          Overlap giúp giữ ngữ cảnh tại ranh giới chunks
         """
         self.model = model
         self.context_window = context_window
         self.collapse_threshold = collapse_threshold
+        self.chunk_overlap = min(chunk_overlap, context_window // 4)  # Max 25% overlap
+        
+        # Khởi tạo protocol và calibrator (giống thư viện gốc)
+        self.protocol = StructuredInfoProtocol(context_window=context_window)
+        self.calibrator = ConfidenceCalibrator()
     
     def chunk_text(self, text: str) -> list:
-        """Chia văn bản thành các chunks"""
+        """
+        Chia văn bản thành các chunks với overlap
+        
+        Overlap giúp giữ ngữ cảnh tại ranh giới chunks, tránh mất thông tin
+        khi một câu hoặc ý tưởng bị cắt giữa 2 chunks.
+        
+        Args:
+            text: Văn bản cần chia
+            
+        Returns:
+            List các text chunks với overlap
+            
+        Example:
+            context_window=1000, overlap=200
+            Chunk 1: tokens[0:1000]
+            Chunk 2: tokens[800:1800]  <- overlap 200 tokens
+            Chunk 3: tokens[1600:2600] <- overlap 200 tokens
+        """
         tokens = self.model.tokenizer.encode(text)
         chunks = []
         
-        for i in range(0, len(tokens), self.context_window):
-            chunk_tokens = tokens[i:i + self.context_window]
+        # Tính step size (context_window - overlap)
+        step_size = self.context_window - self.chunk_overlap
+        
+        i = 0
+        while i < len(tokens):
+            # Lấy chunk với size = context_window
+            chunk_end = min(i + self.context_window, len(tokens))
+            chunk_tokens = tokens[i:chunk_end]
+            
+            # Decode chunk
             chunk_text = self.model.tokenizer.decode(chunk_tokens, skip_special_tokens=True)
             chunks.append(chunk_text)
+            
+            # Di chuyển index với step_size (tạo overlap)
+            i += step_size
+            
+            # Nếu đã đến cuối, break
+            if chunk_end == len(tokens):
+                break
         
         return chunks
     
     def map_stage(self, chunks: list, query: str) -> list:
-        """Xử lý từng chunk"""
+        """
+        Xử lý từng chunk và format theo StructuredInfoProtocol
+        
+        Args:
+            chunks: List các text chunks
+            query: Query gốc
+            
+        Returns:
+            List các mapped results theo structured format
+        """
         mapped_results = []
         
         for i, chunk in enumerate(chunks):
             print(f"  Processing chunk {i+1}/{len(chunks)}...")
+            
+            # Process chunk
             result = self.model.process_chunk(chunk, query)
-            mapped_results.append(result)
+            
+            # Format theo structured protocol (giống thư viện gốc)
+            formatted_result = self.protocol.format_mapped_result(result)
+            mapped_results.append(formatted_result)
         
         return mapped_results
     
     def collapse_stage(self, mapped_results: list, query: str) -> list:
-        """Gộp các kết quả lại"""
+        """
+        Gộp các mapped results thành ít kết quả hơn
+        Sử dụng StructuredInfoProtocol.collapse_results() (giống thư viện gốc)
+        
+        Args:
+            mapped_results: List các mapped results
+            query: Query gốc
+            
+        Returns:
+            List các collapsed results
+        """
         # Nếu ít kết quả, không cần collapse
         if len(mapped_results) <= 2:
             return mapped_results
         
-        # Group các kết quả
+        # Group các kết quả theo collapse_threshold
+        groups = self._group_chunks(mapped_results)
+        
+        # Collapse từng group bằng protocol (giống thư viện gốc)
+        collapsed_results = []
+        for i, group in enumerate(groups):
+            print(f"  Collapsing group {i+1}/{len(groups)}...")
+            collapsed_result = self.protocol.collapse_results(self.model, group, query)
+            collapsed_results.append(collapsed_result)
+        
+        return collapsed_results
+    
+    def _group_chunks(self, mapped_results: list) -> list:
+        """
+        Group các mapped results theo collapse_threshold
+        Logic giống group_chunks() trong thư viện gốc
+        
+        Args:
+            mapped_results: List các mapped results
+            
+        Returns:
+            List of groups
+        """
         groups = []
         current_group = []
         current_length = 0
         
         for result in mapped_results:
-            text = result.get("text", "")
+            # Sử dụng "extracted_info" thay vì "text" (theo protocol)
+            text = result.get("extracted_info", "")
             token_length = len(self.model.tokenizer.encode(text))
             
             if current_length + token_length > self.collapse_threshold:
@@ -214,57 +488,62 @@ class OllamaMapReduceLLM:
         if current_group:
             groups.append(current_group)
         
-        # Collapse từng group
-        collapsed_results = []
-        for group in groups:
-            combined_text = " ".join([r["text"] for r in group])
-            collapse_query = f"{query}\n\nSummarize the following results:\n{combined_text}"
-            
-            result = self.model.generate(collapse_query)
-            collapsed_results.append(result)
-        
-        return collapsed_results
+        return groups
     
     def reduce_stage(self, collapsed_results: list, query: str) -> Dict:
-        """Tổng hợp kết quả cuối cùng"""
+        """
+        Tổng hợp kết quả cuối cùng
+        Sử dụng StructuredInfoProtocol.reduce_results() (giống thư viện gốc)
+        
+        Args:
+            collapsed_results: List các collapsed results
+            query: Query gốc
+            
+        Returns:
+            Final result với answer và confidence_score
+        """
         if len(collapsed_results) == 1:
             return collapsed_results[0]
         
-        # Kết hợp tất cả kết quả
-        combined_text = "\n\n".join([r["text"] for r in collapsed_results])
+        # Sử dụng protocol để reduce (giống thư viện gốc)
+        print(f"  Reducing {len(collapsed_results)} collapsed results...")
+        final_result = self.protocol.reduce_results(self.model, collapsed_results, query)
         
-        # Truncate nếu quá dài
-        tokens = self.model.tokenizer.encode(combined_text)
-        if len(tokens) > self.context_window:
-            tokens = tokens[:self.context_window]
-            combined_text = self.model.tokenizer.decode(tokens, skip_special_tokens=True)
-        
-        final_query = f"{query}\n\nBased on these summaries, provide a final comprehensive answer:\n{combined_text}"
-        
-        final_result = self.model.generate(final_query)
         return final_result
     
     def process_long_text(self, document: str, query: str) -> Dict:
         """
         Xử lý văn bản dài với MapReduce
+        Pipeline: Chunk → Map → Collapse → Reduce
         
         Args:
             document: Văn bản dài cần xử lý
             query: Câu hỏi/yêu cầu
             
         Returns:
-            Dict với keys: "text", "answer", "rationale"
+            Dict với keys:
+            - answer: Câu trả lời cuối cùng
+            - text: Text đầy đủ
+            - confidence_score: Điểm tin cậy (nếu có)
         """
-        print(f"📄 Document length: {len(document)} chars, {len(self.model.tokenizer.encode(document))} tokens")
+        doc_tokens = len(self.model.tokenizer.encode(document))
+        print(f"📄 Document: {len(document)} chars, {doc_tokens} tokens")
         
-        # 1. Chunk văn bản
+        # 1. Chunk văn bản với overlap
         chunks = self.chunk_text(document)
-        print(f"✂️  Split into {len(chunks)} chunks")
+        print(f"✂️  Split into {len(chunks)} chunks (overlap: {self.chunk_overlap} tokens)")
         
         # Nếu chỉ có 1 chunk, xử lý trực tiếp
         if len(chunks) == 1:
             print("📝 Single chunk, processing directly...")
-            return self.model.process_chunk(chunks[0], query)
+            result = self.model.process_chunk(chunks[0], query)
+            # Format theo protocol
+            formatted = self.protocol.format_mapped_result(result)
+            return {
+                "answer": formatted["answer"],
+                "text": formatted["extracted_info"],
+                "confidence_score": formatted["confidence_score"]
+            }
         
         # 2. Map stage
         print("🗺️  Map stage: Processing chunks...")
@@ -281,7 +560,12 @@ class OllamaMapReduceLLM:
         print("📊 Reduce stage: Final aggregation...")
         final_result = self.reduce_stage(collapsed_results, query)
         
-        return final_result
+        # Đảm bảo return format nhất quán
+        return {
+            "answer": final_result.get("answer", final_result.get("text", "")),
+            "text": final_result.get("text", final_result.get("answer", "")),
+            "confidence_score": final_result.get("confidence_score", 1)
+        }
 
 
 # ============= VÍ DỤ SỬ DỤNG =============
@@ -293,7 +577,7 @@ if __name__ == "__main__":
         # 1. Khởi tạo model - tokenizer sẽ tự động detect
         ollama_model = LanguageModelOllamaMapReduce(
             model="shmily_006/Qw3:4b_4bit",  # Model finetune của Qwen3
-            # tokenizer_name sẽ tự động chọn Qwen/Qwen2.5-7B
+            tokenizer_name="Qwen/Qwen3-4B",
             temperature=0.7
         )
         
