@@ -39,10 +39,15 @@ class VectorStore:
 
     async def hybrid_search(self, question):
         ensemble_retriever = EnsembleRetriever(retrievers=[self.bm25_retriever, self.cosine_retriever],
-                                               weights=[0.5, 0.5])
+                                            weights=[0.5, 0.5])
 
         compressed_docs = await ensemble_retriever.ainvoke(question)
-        content_text = "\n\n---\n\n".join([doc.page_content for doc in compressed_docs[:4]])
+        results = []
+        for doc in compressed_docs[:4]:
+            start = doc.metadata.get('start_seconds', None)
+            end = doc.metadata.get('end_seconds', None)
+            results.append(f"[{start} - {end}] {doc.page_content}")
+        content_text = "\n---\n".join(results)
         return content_text
 
     def recursive_chunking(self, file_path):
