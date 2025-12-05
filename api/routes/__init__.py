@@ -5,7 +5,6 @@ from dotenv import load_dotenv
 import tempfile
 # from api.services.whisper import FasterWhisper
 from api.services.chunkformer_stt import ChunkFormer
-from api.services.llm import LLM
 import logging
 import time
 from datetime import datetime
@@ -15,7 +14,6 @@ import os
 import httpx
 # from api.services.local_llm import ChatRequest
 from api.services.local_llm import LanguageModelOllama
-from api.services.video_to_audio_convert import *
 import pynvml
 # import bộ đo GPU
 from api.utils.utils_gpu_mem import GPUMemSampler, detect_device_index

@@ -31,7 +31,6 @@ class LanguageModelOllamaMapReduce(LanguageModelOllama):
         Args:
             model: Tên model Ollama đã pull (vd: "shmily_006/Qw3:4b_4bit")
             tokenizer_name: Tên tokenizer từ HuggingFace. Nếu None, sẽ tự động chọn:
-                           - Qwen models → "Qwen/Qwen2.5-7B"
                            - Llama models → "meta-llama/Llama-3.2-3B" 
                            - Khác → "vinai/phobert-base" (tiếng Việt)
             stream: Stream response hay không
@@ -571,57 +570,21 @@ class OllamaMapReduceLLM:
 # ============= VÍ DỤ SỬ DỤNG =============
 
 if __name__ == "__main__":
-    import asyncio
-    
-    async def test_mapreduce():
-        # 1. Khởi tạo model - tokenizer sẽ tự động detect
-        ollama_model = LanguageModelOllamaMapReduce(
-            model="shmily_006/Qw3:4b_4bit",  # Model finetune của Qwen3
-            tokenizer_name="Qwen/Qwen3-4B",
-            temperature=0.7
-        )
-        
-        # 2. Khởi tạo OllamaMapReduceLLM (custom implementation)
-        mapreduce_llm = OllamaMapReduceLLM(
-            model=ollama_model,
-            context_window=2048,
-            collapse_threshold=1024
-        )
-        
-        # 3. Văn bản dài cần xử lý
-        document = """
-        Hội nghị lần thứ 8 Ban Chấp hành Trung ương Đảng khóa XIII đã diễn ra từ ngày 2-5/10/2023.
-        
-        Hội nghị đã thảo luận và quyết định nhiều vấn đề quan trọng về phát triển kinh tế - xã hội,
-        quốc phòng - an ninh, đối ngoại và xây dựng Đảng. Trung ương đã thông qua Nghị quyết về
-        tiếp tục đẩy mạnh công nghiệp hóa, hiện đại hóa đất nước đến năm 2030, tầm nhìn đến năm 2045.
-        
-        Về phát triển kinh tế, Hội nghị nhấn mạnh cần tập trung phát triển 3 đột phá chiến lược:
-        hoàn thiện thể chế kinh tế thị trường định hướng xã hội chủ nghĩa, phát triển nguồn nhân lực,
-        và xây dựng hạ tầng đồng bộ, hiện đại. 
-        
-        Trung ương cũng đã bàn về công tác cán bộ, quyết định điều động, phân công một số cán bộ
-        giữ các chức vụ lãnh đạo chủ chốt của Đảng và Nhà nước.
-        
-        [... Thêm nhiều nội dung chi tiết khác ...]
-        """
-        
-        # 4. Câu hỏi
-        query = "Tóm tắt các nội dung chính của Hội nghị lần thứ 8 BCH TW Đảng khóa XIII"
-        
-        # 5. Xử lý với MapReduce
-        print("\n" + "="*70)
-        print("Đang xử lý văn bản với MapReduce...")
-        print("="*70)
-        result = mapreduce_llm.process_long_text(document, query)
-        
-        print("\n" + "="*70)
-        print("KẾT QUẢ:")
-        print("="*70)
-        print(result["answer"])
-        
-        # 6. Đóng kết nối
-        await ollama_model.aclose()
-    
-    # Chạy test
-    asyncio.run(test_mapreduce())
+    ollama_model = LanguageModelOllamaMapReduce(
+        model="shmily_006/Qw3:4b_4bit",  # Model custom của bạn
+        tokenizer_name="Qwen/Qwen3-4B",
+        temperature=0.5
+    )
+
+    mapreduce_llm = OllamaMapReduceLLM(
+        model=ollama_model,
+        context_window=4096,  # Điều chỉnh theo model của bạn
+        collapse_threshold=2048,
+        chunk_overlap=200
+    )
+
+    with open("/home/bojjoo/Code/EduAssist/test_data/dienvien Cong Ly.txt") as f:
+        long_document = f.read()
+
+    result = mapreduce_llm.process_long_text(long_document, "Tóm tắt các ý chính")
+    print(result["answer"])
