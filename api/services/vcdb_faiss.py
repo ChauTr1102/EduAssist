@@ -39,10 +39,15 @@ class VectorStore:
 
     async def hybrid_search(self, question):
         ensemble_retriever = EnsembleRetriever(retrievers=[self.bm25_retriever, self.cosine_retriever],
-                                               weights=[0.5, 0.5])
+                                            weights=[0.5, 0.5])
 
         compressed_docs = await ensemble_retriever.ainvoke(question)
-        content_text = "\n\n---\n\n".join([doc.page_content for doc in compressed_docs[:4]])
+        results = []
+        for doc in compressed_docs[:4]:
+            start = doc.metadata.get('start_seconds', None)
+            end = doc.metadata.get('end_seconds', None)
+            results.append(f"[{start} - {end}] {doc.page_content}")
+        content_text = "\n---\n".join(results)
         return content_text
 
     def recursive_chunking(self, file_path):
@@ -218,6 +223,27 @@ class VectorStore:
 
         # Nếu không xác định threshold → luôn coi là “chưa xử lý”
         return False
+
+        # Thêm vào class VectorStore
+        # Trong class VectorStore:
+    async def search_for_benchmark(self, question, k=10, weight_bm25=0.5, weight_cosine=0.5):
+        """
+        Hàm search benchmark cho phép tùy chỉnh trọng số Hybrid.
+        """
+        if not self.bm25_retriever or not self.cosine_retriever:
+            print("❌ Retrievers not initialized properly!")
+            return []
+
+        # Khởi tạo EnsembleRetriever với trọng số động
+        ensemble_retriever = EnsembleRetriever(
+            retrievers=[self.bm25_retriever, self.cosine_retriever],
+            weights=[weight_bm25, weight_cosine]
+        )
+
+        # Lấy top K kết quả
+        docs = await ensemble_retriever.ainvoke(question)
+        return docs[:k]
+
 
     # # upload file và lưu vào vectorstore faiss, lưu file vào folder của conversation_id
     # def upload_file(self, file: UploadFile = File(...), user_id: str = Form(...), folder_id: str = Form(...),
