@@ -224,6 +224,27 @@ class VectorStore:
         # Nếu không xác định threshold → luôn coi là “chưa xử lý”
         return False
 
+        # Thêm vào class VectorStore
+        # Trong class VectorStore:
+    async def search_for_benchmark(self, question, k=10, weight_bm25=0.5, weight_cosine=0.5):
+        """
+        Hàm search benchmark cho phép tùy chỉnh trọng số Hybrid.
+        """
+        if not self.bm25_retriever or not self.cosine_retriever:
+            print("❌ Retrievers not initialized properly!")
+            return []
+
+        # Khởi tạo EnsembleRetriever với trọng số động
+        ensemble_retriever = EnsembleRetriever(
+            retrievers=[self.bm25_retriever, self.cosine_retriever],
+            weights=[weight_bm25, weight_cosine]
+        )
+
+        # Lấy top K kết quả
+        docs = await ensemble_retriever.ainvoke(question)
+        return docs[:k]
+
+
     # # upload file và lưu vào vectorstore faiss, lưu file vào folder của conversation_id
     # def upload_file(self, file: UploadFile = File(...), user_id: str = Form(...), folder_id: str = Form(...),
     #                 semantic_chunking: bool = Form(...)):
