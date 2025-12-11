@@ -99,7 +99,10 @@ class LanguageModelOllama:
                                         "prompt": prompt,
                                         "stream": self.stream,
                                         "think": False,
-                                        "temperature": self.temperature
+                                        "temperature": self.temperature,
+                                        "options": {
+                                            "num_ctx": 7000
+                                        }
                                     },
                                     timeout=60.0
                                 )

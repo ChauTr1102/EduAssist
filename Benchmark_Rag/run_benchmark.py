@@ -3,7 +3,7 @@ import time
 import asyncio
 import numpy as np
 from tqdm import tqdm
-from api.services.vcdb_faiss import VectorStore  # Sửa path import cho đúng với project của bạn
+from api.services.vcdb_faiss import VectorStore
 from langchain_huggingface.embeddings import HuggingFaceEmbeddings
 
 # CẤU HÌNH
@@ -12,7 +12,8 @@ BENCHMARK_PATH = "benchmark_questions.jsonl"
 MODEL_EMBEDDING = "Alibaba-NLP/gte-multilingual-base"
 VECTOR_DB_PATH = "../vectorstores/Benchmark_rag"
 
-NUM_QUESTIONS_TO_TEST = 1000  # Test 200 câu cho mỗi cấu hình
+# Số lượng câu hỏi muốn test (Lưu ý: 19000 câu sẽ chạy rất lâu, nếu test nhanh nên giảm xuống)
+NUM_QUESTIONS_TO_TEST = 19000
 
 
 async def main():
@@ -22,7 +23,7 @@ async def main():
         model_kwargs={"trust_remote_code": True}
     )
 
-    # Init VectorStore (Lưu ý: class VectorStore của bạn phải tự load DB bên trong __init__ hoặc gán thủ công như bạn đã làm ở các phiên bản trước)
+    # Init VectorStore
     vector_store = VectorStore("Benchmark_rag", model_embedding)
 
     # Load câu hỏi
@@ -46,77 +47,93 @@ async def main():
     for w_bm25, w_cos in weights_to_test:
         print(f"\n⚙️ Testing Config: BM25={w_bm25} | Cosine={w_cos}")
 
-        recall_at_1 = 0  # <--- Thêm biến đếm Recall@1
+        recall_at_1 = 0
         recall_at_5 = 0
+        recall_at_8 = 0  # <--- Mới
+        recall_at_10 = 0  # <--- Mới
         mrr_score = 0
 
-        # Dùng tqdm để hiện thanh tiến trình cho mỗi config
         for item in tqdm(questions, desc=f"Eval {w_bm25}/{w_cos}", leave=False):
             query = item['question']
             ground_truth_id = item['ground_truth_doc_id']
 
-            # Gọi hàm search với trọng số động
+            # QUAN TRỌNG: Phải lấy k=10 thì mới tính được Recall@10
             retrieved_docs = await vector_store.search_for_benchmark(
-                query, k=5,
+                query, k=10,
                 weight_bm25=w_bm25,
                 weight_cosine=w_cos
             )
 
             retrieved_ids = [doc.metadata.get('doc_id') for doc in retrieved_docs]
 
-            # 1. Tính Recall@5 (Có trong top 5)
+            # Kiểm tra xem đáp án đúng có trong list tìm thấy không
             if ground_truth_id in retrieved_ids:
-                recall_at_5 += 1
+                # Lấy vị trí (index) của đáp án đúng (bắt đầu từ 0)
+                rank_index = retrieved_ids.index(ground_truth_id)
+
+                # Recall@1: Nằm ở vị trí đầu tiên (index 0)
+                if rank_index == 0:
+                    recall_at_1 += 1
+
+                # Recall@5: Nằm trong 5 vị trí đầu (index 0-4)
+                if rank_index < 5:
+                    recall_at_5 += 1
+
+                # Recall@8: Nằm trong 8 vị trí đầu (index 0-7)
+                if rank_index < 8:
+                    recall_at_8 += 1
+
+                # Recall@10: Nằm trong 10 vị trí đầu (index 0-9)
+                # Vì ta đã check `if ground_truth_id in retrieved_ids` và k=10 nên chắc chắn đúng
+                if rank_index < 10:
+                    recall_at_10 += 1
 
                 # Tính MRR
-                rank = retrieved_ids.index(ground_truth_id) + 1
-                mrr_score += 1 / rank
-
-            # 2. Tính Recall@1 (Có ngay ở vị trí đầu tiên)
-            if retrieved_ids and ground_truth_id == retrieved_ids[0]:  # <--- Logic tính Recall@1
-                recall_at_1 += 1
+                mrr_score += 1 / (rank_index + 1)
 
         # Tổng kết cho config này
-        score_recall_1 = recall_at_1 / len(questions)  # <---
-        score_recall_5 = recall_at_5 / len(questions)
-        score_mrr = mrr_score / len(questions)
-
-        final_results.append({
+        scores = {
             "bm25": w_bm25,
             "cosine": w_cos,
-            "recall@1": score_recall_1,  # <--- Lưu vào dict
-            "recall@5": score_recall_5,
-            "mrr": score_mrr
-        })
+            "recall@1": recall_at_1 / len(questions),
+            "recall@5": recall_at_5 / len(questions),
+            "recall@8": recall_at_8 / len(questions),  # <---
+            "recall@10": recall_at_10 / len(questions),  # <---
+            "mrr": mrr_score / len(questions)
+        }
 
-        print(f"   -> R@1: {score_recall_1:.2%} | R@5: {score_recall_5:.2%} | MRR: {score_mrr:.4f}")
+        final_results.append(scores)
+
+        print(
+            f"   -> R@1: {scores['recall@1']:.2%} | R@5: {scores['recall@5']:.2%} | R@10: {scores['recall@10']:.2%} | MRR: {scores['mrr']:.4f}")
 
     # --- IN BẢNG KẾT QUẢ CUỐI CÙNG ---
-    print("\n" + "=" * 70)  # Kéo dài bảng ra chút cho đẹp
-    # Thêm cột Recall@1 vào Header
-    print(f"{'BM25':<10} | {'Cosine':<10} | {'Recall@1':<10} | {'Recall@5':<10} | {'MRR':<10}")
-    print("-" * 70)
+    # Kéo dài bảng ra để chứa đủ cột
+    print("\n" + "=" * 100)
+    header = f"{'BM25':<6} | {'Cosine':<6} | {'R@1':<8} | {'R@5':<8} | {'R@8':<8} | {'R@10':<8} | {'MRR':<8}"
+    print(header)
+    print("-" * 100)
 
-    # Tìm best result (Vẫn dựa trên Recall@5 hoặc MRR để chọn best)
+    # Tìm best result (Vẫn dựa trên Recall@5 làm tiêu chuẩn, hoặc bạn đổi sang R@10 tùy ý)
     best_score = -1
     best_config = None
 
     for res in final_results:
-        # In thêm cột Recall@1
-        print(
-            f"{res['bm25']:<10} | {res['cosine']:<10} | {res['recall@1']:.2%}     | {res['recall@5']:.2%}     | {res['mrr']:.4f}")
+        row = f"{res['bm25']:<6} | {res['cosine']:<6} | {res['recall@1']:.2%}   | {res['recall@5']:.2%}   | {res['recall@8']:.2%}   | {res['recall@10']:.2%}   | {res['mrr']:.4f}"
+        print(row)
 
-        # Chọn best config dựa trên Recall@5 (hoặc bạn có thể đổi thành MRR tùy ý muốn)
         if res['recall@5'] > best_score:
             best_score = res['recall@5']
             best_config = res
 
-    print("-" * 70)
-    print(f"🏆 BEST CONFIGURATION: BM25={best_config['bm25']} / Cosine={best_config['cosine']}")
-    print(f"   With Recall@1: {best_config['recall@1']:.2%}")  # In ra kết quả best
-    print(f"   With Recall@5: {best_config['recall@5']:.2%}")
-    print(f"   With MRR:      {best_config['mrr']:.4f}")
-    print("=" * 70)
+    print("-" * 100)
+    print(f"🏆 BEST CONFIGURATION (Based on R@5): BM25={best_config['bm25']} / Cosine={best_config['cosine']}")
+    print(f"   Recall@1:  {best_config['recall@1']:.2%}")
+    print(f"   Recall@5:  {best_config['recall@5']:.2%}")
+    print(f"   Recall@8:  {best_config['recall@8']:.2%}")
+    print(f"   Recall@10: {best_config['recall@10']:.2%}")
+    print(f"   MRR:       {best_config['mrr']:.4f}")
+    print("=" * 100)
 
 
 if __name__ == "__main__":

@@ -12,6 +12,7 @@ sys.path.insert(0, '/home/bojjoo/Code/EduAssist')
 from api.services.local_llm import LanguageModelOllama
 from transformers import AutoTokenizer
 from typing import Dict
+from api.config import *
 
 
 class LanguageModelOllamaMapReduce(LanguageModelOllama):
@@ -134,7 +135,13 @@ class LanguageModelOllamaMapReduce(LanguageModelOllama):
             Dict với keys: "text", "answer", "rationale"
         """
         # Tạo prompt kết hợp query và chunk
-        combined_input = f"{query}\n\nDocument:\n{chunk}"
+        # IMPROVED: Thêm yêu cầu model tự generate rationale để tính confidence chính xác
+        combined_input = f"""{query}
+
+Document:
+{chunk}
+
+Hãy trả lời và giải thích độ tin cậy của câu trả lời (rõ ràng/chắc chắn/có thể/suy luận/không có thông tin)."""
         
         # Truncate nếu quá dài (dựa trên tokenizer)
         tokens = self.tokenizer.encode(combined_input)
@@ -580,11 +587,11 @@ if __name__ == "__main__":
         model=ollama_model,
         context_window=4096,  # Điều chỉnh theo model của bạn
         collapse_threshold=2048,
-        chunk_overlap=200
+        chunk_overlap=0
     )
 
     with open("/home/bojjoo/Code/EduAssist/test_data/dienvien Cong Ly.txt") as f:
         long_document = f.read()
 
-    result = mapreduce_llm.process_long_text(long_document, "Tóm tắt các ý chính")
+    result = mapreduce_llm.process_long_text(long_document, "tóm tắt các ý chính")
     print(result["answer"])
