@@ -1,0 +1,67 @@
+# Ollama MapReduce Configuration
+ollama:
+  model: shmily_006/Qw3:4b_4bit
+  host: http://localhost:11434
+  tokenizer: Qwen/Qwen3-4B
+
+gen_args:
+  temperature: 0.5
+  max_tokens: 1024
+
+# Map-Reduce Prompts (Vietnamese - Optimized for Summarization)
+map_prompt: |
+  Bạn được cung cấp một phần của bài viết và một câu hỏi. Hãy đọc phần bài viết này và làm theo hướng dẫn của tôi.
+
+  Bài viết:
+  Bài viết bắt đầu như sau:
+  {context}
+  Bài viết kết thúc tại đây.
+
+  Câu hỏi:
+  {question}
+
+  Hướng dẫn:
+
+  Hãy trích xuất và tóm tắt thông tin từ đoạn văn được cung cấp để cố gắng trả lời câu hỏi đã cho. Lưu ý rằng bạn chỉ có một phần của toàn bộ văn bản, vì vậy thông tin bạn thu được có thể không trả lời đầy đủ câu hỏi.
+
+  1. Tóm tắt Thông tin: Xác định các thông tin quan trọng từ đoạn văn có liên quan đến câu hỏi và cung cấp một bản tóm tắt ngắn gọn.
+
+  Vui lòng tuân theo định dạng này:
+
+  Tóm tắt:
+
+collapse_prompt: |
+  Bạn cần xử lý một tác vụ với ngữ cảnh dài vượt quá giới hạn ngữ cảnh của bạn. Cách khả thi duy nhất để xử lý điều này là xử lý từng phần ngữ cảnh dài. Bạn được cung cấp một câu hỏi và các bản tóm tắt được trích xuất từ mỗi phần. Hãy đọc các bản tóm tắt và làm theo hướng dẫn của tôi.
+
+  Các bản tóm tắt:
+  Các bản tóm tắt bắt đầu như sau:
+  {context}
+  Các bản tóm tắt kết thúc tại đây.
+
+  Câu hỏi:
+  {question}
+
+  Hướng dẫn:
+
+  Tích hợp và tóm tắt các bản tóm tắt được cung cấp để trả lời câu hỏi:
+
+  1. Tích hợp và Tóm tắt Thông tin: Thu thập tất cả các bản tóm tắt và cung cấp một bản tóm tắt tích hợp, ngắn gọn có liên quan đến việc giải quyết câu hỏi.
+
+  Vui lòng tuân theo định dạng này:
+
+  Tóm tắt:
+
+reduce_prompt: |
+  Bạn cần xử lý một tác vụ với ngữ cảnh dài vượt quá giới hạn ngữ cảnh của bạn. Cách khả thi duy nhất để xử lý điều này là xử lý từng phần ngữ cảnh dài. Bạn được cung cấp một câu hỏi và các bản tóm tắt được trích xuất từ mỗi phần. Hãy đọc các bản tóm tắt và làm theo hướng dẫn của tôi.
+
+  Các bản tóm tắt:
+  Các bản tóm tắt bắt đầu như sau:
+  {context}
+  Các bản tóm tắt kết thúc tại đây.
+
+  Câu hỏi:
+  {question}
+
+  Hướng dẫn:
+
+  Tích hợp và tóm tắt các bản tóm tắt được cung cấp để trả lời câu hỏi. Thu thập tất cả các bản tóm tắt và cung cấp một bản tóm tắt tích hợp, ngắn gọn có liên quan đến việc giải quyết câu hỏi. Cung cấp bản tóm tắt chi tiết nhất có thể.
