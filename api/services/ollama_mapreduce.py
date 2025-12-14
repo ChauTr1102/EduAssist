@@ -454,18 +454,18 @@ def load_config(config_path: str) -> Dict:
 if __name__ == "__main__":
     # Load config từ file YAML
     config = load_config("config_ollama_mapreduce.yaml")
-    
+
     # Khởi tạo pipeline
     pipeline = OllamaMapReducePipeline(config)
-    
+
     # Load document
     with open("/home/bojjoo/Code/EduAssist/test_data/hop_quochoi_lan10_khoaXV.txt") as f:
         document = f.read()
-    
+
     # Chạy pipeline
     question = "Tóm tắt các ý chính của cuộc họp, trình bày rõ ràng thành từng mục nếu cần thiết"
     result = pipeline.run(document, question, chunk_size=4096)
-    
+
     print("\n" + "="*60)
     print("FINAL RESULT")
     print("="*60)
