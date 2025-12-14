@@ -559,7 +559,12 @@ def select_meeting(meeting_id):
 # Custom CSS
 custom_css = """
 .gradio-container {
-    max-width: 1400px !important;
+    max-width: none !important;
+    width: 100% !important;
+    padding: 0 20px;
+}
+.row, .block {
+    width: 100%;
 }
 .tab-nav button {
     font-size: 16px;
@@ -658,7 +663,7 @@ with gr.Blocks(title="Meeting Assistant", css=custom_css, theme=gr.themes.Soft()
                     status_box = gr.Markdown("_Chưa bắt đầu_")
             
             # Main content: 3 columns
-            with gr.Row():
+            with gr.Row(equal_height=True):
                 # Left: Transcript
                 with gr.Column(scale=2):
                     gr.Markdown("### 📄 Transcript")
